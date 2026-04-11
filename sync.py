@@ -20,13 +20,17 @@ MY_TZ = timezone(timedelta(hours=8))
 now_my = datetime.now(MY_TZ)
 today_str = now_my.strftime("%Y-%m-%d")
 
-start_utc = datetime(now_my.year, now_my.month, now_my.day, 0, 0, 0, tzinfo=MY_TZ).astimezone(timezone.utc)
-end_utc   = datetime(now_my.year, now_my.month, now_my.day, 23, 59, 59, tzinfo=MY_TZ).astimezone(timezone.utc)
+# Window: 12:00:00 AM → now (MY time), converted to UTC
+# Matches Shopify Analytics "Today" range exactly (12am–now)
+start_my  = datetime(now_my.year, now_my.month, now_my.day, 0, 0, 0, tzinfo=MY_TZ)
+start_utc = start_my.astimezone(timezone.utc)
+end_utc   = now_my.astimezone(timezone.utc)   # "now" — not end of day
 start_str = start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 end_str   = end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 print(f"📅 Fetching orders for {today_str} (MY time)")
-print(f"   UTC range: {start_str} → {end_str}")
+print(f"   MY  range : 12:00:00 AM → {now_my.strftime('%I:%M:%S %p')}")
+print(f"   UTC range : {start_str} → {end_str}")
 
 headers = {
     "X-Shopify-Access-Token": SHOPIFY_TOKEN,
@@ -40,11 +44,11 @@ def fetch_all_orders(extra_params={}):
         "created_at_min": start_str,
         "created_at_max": end_str,
         "limit": 250,
-        # current_subtotal_price = line items after discounts, before shipping/tax
-        # current_total_price    = final price after ALL refunds already applied
-        # subtotal_price         = original line items total (no refunds)
-        # We need gross (original) and net (after refunds) to mirror Shopify analytics
-        "fields": "id,subtotal_price,current_subtotal_price,total_price,current_total_price,financial_status,cancel_reason,refunds",
+        # subtotal_price         = gross line items (no refunds, no shipping, no tax)
+        # refunds[]              = all refund events on the order
+        # refund_line_items[].subtotal = the pre-tax refunded line item amount
+        #                          → this is exactly what Shopify calls "Returns"
+        "fields": "id,subtotal_price,financial_status,cancel_reason,refunds",
         **extra_params
     }
     while url:
@@ -65,25 +69,31 @@ def fetch_all_orders(extra_params={}):
                     break
     return all_orders
 
-# ── Fetch ALL active orders ───────────────────────────────────
+# ── Fetch ALL orders in today's window ───────────────────────
 all_orders = fetch_all_orders({
     "status": "any",
     "financial_status": "any"
 })
 
-# Filter out cancelled orders
+# Filter out cancelled orders (matching Shopify Analytics behaviour)
 active_orders = [o for o in all_orders if o.get("cancel_reason") is None]
 total_orders  = len(active_orders)
 
-# ── Match Shopify Analytics exactly ──────────────────────────
-# Shopify "Gross sales" = sum of subtotal_price (original line items, before refunds)
-# Shopify "Returns"     = gross - net  (difference between original and current)
-# Shopify "Net sales"   = sum of current_subtotal_price (after refunds already applied)
-# Using current_subtotal_price avoids double-counting that happens when you
-# subtract refund_line_items from total_price manually.
-gross_sale    = sum(float(o.get("subtotal_price", 0))         for o in active_orders)
-net_sale      = sum(float(o.get("current_subtotal_price", 0)) for o in active_orders)
-total_returns = gross_sale - net_sale
+# ── Gross sales ───────────────────────────────────────────────
+# subtotal_price = line items total before any refunds, discounts already applied
+gross_sale = sum(float(o.get("subtotal_price", 0)) for o in active_orders)
+
+# ── Returns (Shopify Analytics definition) ────────────────────
+# Sum refund_line_items[].subtotal across every refund on every active order.
+# "subtotal" on refund_line_items is the pre-tax line item refund amount —
+# this is the exact figure Shopify uses for the "Returns" row in analytics.
+total_returns = 0.0
+for order in active_orders:
+    for refund in order.get("refunds", []):
+        for rli in refund.get("refund_line_items", []):
+            total_returns += float(rli.get("subtotal", 0))
+
+net_sale = gross_sale - total_returns
 
 print(f"\n📊 Results:")
 print(f"   Total orders : {total_orders}")
@@ -91,9 +101,22 @@ print(f"   Gross sale   : RM{gross_sale:.2f}")
 print(f"   Returns      : -RM{total_returns:.2f}")
 print(f"   Net sale     : RM{net_sale:.2f}")
 
+# ── Debug: print per-order breakdown ─────────────────────────
+print(f"\n📋 Per-order breakdown:")
+for o in active_orders:
+    oid      = o["id"]
+    subtotal = float(o.get("subtotal_price", 0))
+    refunded = sum(
+        float(rli.get("subtotal", 0))
+        for refund in o.get("refunds", [])
+        for rli in refund.get("refund_line_items", [])
+    )
+    print(f"   #{oid} | subtotal={subtotal:.2f} | refunded={refunded:.2f} | net={subtotal - refunded:.2f} | status={o.get('financial_status')}")
+
 updated_at = now_my.strftime("%H:%M:%S")
 
 # ── Push to Firestore ─────────────────────────────────────────
+# Use merge=True so manual fields (lastYearSale, dailyTarget) are preserved
 doc_ref = db.collection("sales").document("today")
 doc_ref.set({
     "currentSale":  round(net_sale, 2),
