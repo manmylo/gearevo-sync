@@ -20,75 +20,89 @@ MY_TZ = timezone(timedelta(hours=8))
 now_my = datetime.now(MY_TZ)
 today_str = now_my.strftime("%Y-%m-%d")
 
-# Shopify stores timestamps in UTC — convert start/end of MY day to UTC
-start_of_day_utc = datetime(now_my.year, now_my.month, now_my.day, 0, 0, 0, tzinfo=MY_TZ).astimezone(timezone.utc)
-end_of_day_utc   = datetime(now_my.year, now_my.month, now_my.day, 23, 59, 59, tzinfo=MY_TZ).astimezone(timezone.utc)
-
-start_str = start_of_day_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-end_str   = end_of_day_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+start_utc = datetime(now_my.year, now_my.month, now_my.day, 0, 0, 0, tzinfo=MY_TZ).astimezone(timezone.utc)
+end_utc   = datetime(now_my.year, now_my.month, now_my.day, 23, 59, 59, tzinfo=MY_TZ).astimezone(timezone.utc)
+start_str = start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+end_str   = end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 print(f"📅 Fetching orders for {today_str} (MY time)")
 print(f"   UTC range: {start_str} → {end_str}")
 
-# ── Fetch ALL paid orders with pagination ────────────────────
 headers = {
     "X-Shopify-Access-Token": SHOPIFY_TOKEN,
     "Content-Type": "application/json"
 }
 
-all_orders = []
-url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json"
-params = {
-    "financial_status": "paid",
-    "created_at_min": start_str,
-    "created_at_max": end_str,
-    "limit": 250,
-    "fields": "id,total_price,currency"
-}
-
-# Paginate through all results
-while url:
-    response = requests.get(url, params=params, headers=headers)
-
-    if response.status_code != 200:
-        print(f"❌ Shopify API error {response.status_code}: {response.text}")
-        exit(1)
-
-    batch = response.json().get("orders", [])
-    all_orders.extend(batch)
-    print(f"   Fetched {len(batch)} orders (total so far: {len(all_orders)})")
-
-    # Check for next page via Link header
-    link_header = response.headers.get("Link", "")
-    if 'rel="next"' in link_header:
-        # Extract next URL
-        parts = link_header.split(",")
-        next_url = None
-        for part in parts:
-            if 'rel="next"' in part:
-                next_url = part.split(";")[0].strip().strip("<>")
-                break
-        url = next_url
-        params = {}  # params are in the URL already
-    else:
+def fetch_all_orders(extra_params={}):
+    all_orders = []
+    url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json"
+    params = {
+        "created_at_min": start_str,
+        "created_at_max": end_str,
+        "limit": 250,
+        "fields": "id,total_price,financial_status,cancel_reason,refunds",
+        **extra_params
+    }
+    while url:
+        response = requests.get(url, params=params, headers=headers)
+        if response.status_code != 200:
+            print(f"❌ Shopify API error {response.status_code}: {response.text}")
+            exit(1)
+        batch = response.json().get("orders", [])
+        all_orders.extend(batch)
+        print(f"   Got {len(batch)} orders (total: {len(all_orders)})")
+        link = response.headers.get("Link", "")
         url = None
+        if 'rel="next"' in link:
+            for part in link.split(","):
+                if 'rel="next"' in part:
+                    url = part.split(";")[0].strip().strip("<>")
+                    params = {}
+                    break
+    return all_orders
 
-# ── Calculate totals ─────────────────────────────────────────
-total_sale   = sum(float(o.get("total_price", 0)) for o in all_orders)
-total_orders = len(all_orders)
-updated_at   = now_my.strftime("%H:%M:%S")  # 24h format e.g. 14:30:00
+# ── Fetch ALL active orders ───────────────────────────────────
+all_orders = fetch_all_orders({
+    "status": "any",
+    "financial_status": "any"
+})
 
-print(f"✅ Total Sale: RM{total_sale:.2f} | Orders: {total_orders} | Updated: {updated_at}")
+# Filter out cancelled orders
+active_orders = [o for o in all_orders if o.get("cancel_reason") is None]
+
+total_orders = len(active_orders)
+gross_sale   = sum(float(o.get("total_price", 0)) for o in active_orders)
+
+# ── Calculate total refunds ───────────────────────────────────
+total_refunds = 0.0
+for order in active_orders:
+    for refund in order.get("refunds", []):
+        for transaction in refund.get("transactions", []):
+            # Only count successful refund transactions
+            if transaction.get("kind") == "refund" and transaction.get("status") == "success":
+                total_refunds += float(transaction.get("amount", 0))
+
+net_sale = gross_sale - total_refunds
+
+print(f"\n📊 Results:")
+print(f"   Total orders (excl. cancelled): {total_orders}")
+print(f"   Gross sale:   RM{gross_sale:.2f}")
+print(f"   Refunds:     -RM{total_refunds:.2f}")
+print(f"   Net sale:     RM{net_sale:.2f}")
+
+updated_at = now_my.strftime("%H:%M:%S")
 
 # ── Push to Firestore ────────────────────────────────────────
 doc_ref = db.collection("sales").document("today")
-
 doc_ref.set({
-    "currentSale":  round(total_sale, 2),
+    "currentSale":  round(net_sale, 2),      # net sale as the main figure
+    "grossSale":    round(gross_sale, 2),     # gross for reference
+    "totalRefunds": round(total_refunds, 2),  # refunds for reference
     "totalOrders":  total_orders,
     "updatedAt":    updated_at,
     "syncedAt":     now_my.isoformat(),
     "source":       "shopify",
-}, merge=True)  # merge=True keeps lastYearSale, dailyTarget set manually
+}, merge=True)
 
-print("🔥 Firestore updated successfully!")
+print(f"\n✅ Synced to Firestore!")
+print(f"🔥 Net: RM{net_sale:.2f} | Gross: RM{gross_sale:.2f} | Refunds: RM{total_refunds:.2f} | Orders: {total_orders}")
