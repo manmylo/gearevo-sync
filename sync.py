@@ -40,14 +40,11 @@ daily_target   = 0.0
 
 try:
     df = pd.read_excel("Sales_and_Target.xlsx")
-
-    # Normalize column names (strip spaces, lowercase)
     df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
 
-    # Parse date column — try common column name variants
-    date_col = next((c for c in df.columns if "date" in c), None)
+    date_col     = next((c for c in df.columns if "date" in c), None)
     lastyear_col = next((c for c in df.columns if "last" in c and "year" in c or "last_year" in c), None)
-    target_col = next((c for c in df.columns if "target" in c), None)
+    target_col   = next((c for c in df.columns if "target" in c), None)
 
     print(f"   Excel columns  : {list(df.columns)}")
     print(f"   Date col       : {date_col}")
@@ -57,7 +54,6 @@ try:
     if date_col and lastyear_col:
         df[date_col] = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
         today_dt = pd.Timestamp(now_my.year, now_my.month, now_my.day)
-
         row = df[df[date_col] == today_dt]
 
         if not row.empty:
@@ -68,20 +64,19 @@ try:
                 if pd.notna(target_val) and float(target_val) > 0:
                     daily_target = float(target_val)
                 else:
-                    # Target missing for today — use last known non-zero target
                     past = df[(df[date_col] <= today_dt) & df[target_col].notna() & (df[target_col] > 0)]
                     if not past.empty:
                         daily_target = float(past.iloc[-1][target_col])
-                        print(f"   ⚠️  No target for today — using last known: RM{daily_target}")
+                        print(f"   ⚠️  No target for today — using last known: RM{daily_target:.2f}")
 
-            print(f"   ✅ Excel match : LastYear=RM{last_year_sale} | Target=RM{daily_target}")
+            print(f"   ✅ Excel match : LastYear=RM{last_year_sale:.2f} | Target=RM{daily_target:.2f}")
         else:
             print(f"   ⚠️  No row found for {today_str} in Excel — using 0")
     else:
         print(f"   ❌ Could not find required columns in Excel")
 
 except FileNotFoundError:
-    print(f"   ❌ Sales_and_Target.xlsx not found in repo — skipping Excel sync")
+    print(f"   ❌ Sales_and_Target.xlsx not found — skipping Excel sync")
 except Exception as e:
     print(f"   ❌ Excel read error: {e}")
 
@@ -96,7 +91,7 @@ params = {
     "status":           "any",
     "financial_status": "any",
     "limit":            250,
-    "fields":           "id,subtotal_price,financial_status,cancel_reason,refunds",
+    "fields":           "id,order_number,subtotal_price,financial_status,cancel_reason,refunds",
 }
 
 while url:
@@ -119,45 +114,58 @@ while url:
 active_orders = [o for o in all_orders if o.get("cancel_reason") is None]
 total_orders  = len(active_orders)
 
-# ── STEP 3: Calculate net sales ───────────────────────────────
+print(f"   Active orders  : {total_orders} (cancelled excluded: {len(all_orders) - total_orders})")
+
+# ── STEP 3: Per-order breakdown + totals ─────────────────────
+print(f"\n{'─'*65}")
+print(f"{'Order':<10} {'Gross':>12} {'Returns':>12} {'Net':>12}  Status")
+print(f"{'─'*65}")
+
 gross_sale    = 0.0
 total_returns = 0.0
 
 for o in active_orders:
-    subtotal = float(o.get("subtotal_price", 0))
+    order_num     = o.get("order_number", o["id"])
+    subtotal      = float(o.get("subtotal_price", 0))
     order_returns = sum(
         float(rli.get("subtotal", 0))
         for refund in o.get("refunds", [])
         for rli in refund.get("refund_line_items", [])
     )
+    order_net     = subtotal - order_returns
     gross_sale    += subtotal
     total_returns += order_returns
 
-net_sale = gross_sale - total_returns
+    refund_flag = " ↩" if order_returns > 0 else ""
+    print(f"#{order_num:<9} {subtotal:>12.2f} {order_returns:>12.2f} {order_net:>12.2f}  {o.get('financial_status','')}{refund_flag}")
 
-print(f"\n📊 Results:")
-print(f"   Orders      : {total_orders}")
+print(f"{'─'*65}")
+net_sale = gross_sale - total_returns
+print(f"{'TOTAL':<10} {gross_sale:>12.2f} {total_returns:>12.2f} {net_sale:>12.2f}")
+print(f"{'─'*65}")
+
+print(f"\n📊 Summary:")
 print(f"   Gross       : RM{gross_sale:.2f}")
 print(f"   Returns     : -RM{total_returns:.2f}")
-print(f"   Net         : RM{net_sale:.2f}")
+print(f"   Net         : RM{net_sale:.2f}  ← pushed to Firestore")
 print(f"   Last Year   : RM{last_year_sale:.2f}")
 print(f"   Target      : RM{daily_target:.2f}")
 
 updated_at = now_my.strftime("%H:%M:%S")
 
-# ── STEP 4: Push ALL fields to Firestore ─────────────────────
+# ── STEP 4: Push to Firestore (no rounding — keep 2 decimal places as-is) ──
 doc_ref = db.collection("sales").document("today")
 doc_ref.set({
-    "currentSale":  round(net_sale, 2),
-    "grossSale":    round(gross_sale, 2),
-    "totalRefunds": round(total_returns, 2),
+    "currentSale":  float(f"{net_sale:.2f}"),
+    "grossSale":    float(f"{gross_sale:.2f}"),
+    "totalRefunds": float(f"{total_returns:.2f}"),
     "totalOrders":  total_orders,
-    "lastYearSale": round(last_year_sale, 2),
-    "dailyTarget":  round(daily_target, 2),
+    "lastYearSale": float(f"{last_year_sale:.2f}"),
+    "dailyTarget":  float(f"{daily_target:.2f}"),
     "updatedAt":    updated_at,
     "syncedAt":     now_my.isoformat(),
     "source":       "shopify",
-}, merge=False)   # overwrite fully — Excel is now the source of truth
+}, merge=False)
 
 print(f"\n✅ Firestore synced!")
 print(f"🔥 Net RM{net_sale:.2f} | LastYear RM{last_year_sale:.2f} | Target RM{daily_target:.2f} | Orders {total_orders}")
