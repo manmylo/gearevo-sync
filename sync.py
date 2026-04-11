@@ -40,7 +40,11 @@ def fetch_all_orders(extra_params={}):
         "created_at_min": start_str,
         "created_at_max": end_str,
         "limit": 250,
-        "fields": "id,total_price,financial_status,cancel_reason,refunds",
+        # current_subtotal_price = line items after discounts, before shipping/tax
+        # current_total_price    = final price after ALL refunds already applied
+        # subtotal_price         = original line items total (no refunds)
+        # We need gross (original) and net (after refunds) to mirror Shopify analytics
+        "fields": "id,subtotal_price,current_subtotal_price,total_price,current_total_price,financial_status,cancel_reason,refunds",
         **extra_params
     }
     while url:
@@ -70,18 +74,16 @@ all_orders = fetch_all_orders({
 # Filter out cancelled orders
 active_orders = [o for o in all_orders if o.get("cancel_reason") is None]
 total_orders  = len(active_orders)
-gross_sale    = sum(float(o.get("total_price", 0)) for o in active_orders)
 
-# ── Calculate returns using refund_line_items subtotal ────────
-# This matches Shopify's "Returns" figure exactly
-total_returns = 0.0
-for order in active_orders:
-    for refund in order.get("refunds", []):
-        for item in refund.get("refund_line_items", []):
-            subtotal = float(item.get("subtotal", 0))
-            total_returns += subtotal
-
-net_sale = gross_sale - total_returns
+# ── Match Shopify Analytics exactly ──────────────────────────
+# Shopify "Gross sales" = sum of subtotal_price (original line items, before refunds)
+# Shopify "Returns"     = gross - net  (difference between original and current)
+# Shopify "Net sales"   = sum of current_subtotal_price (after refunds already applied)
+# Using current_subtotal_price avoids double-counting that happens when you
+# subtract refund_line_items from total_price manually.
+gross_sale    = sum(float(o.get("subtotal_price", 0))         for o in active_orders)
+net_sale      = sum(float(o.get("current_subtotal_price", 0)) for o in active_orders)
+total_returns = gross_sale - net_sale
 
 print(f"\n📊 Results:")
 print(f"   Total orders : {total_orders}")
