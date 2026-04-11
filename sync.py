@@ -61,6 +61,7 @@ doc_ref.set({
     "totalOrders": total_orders,
     "updatedAt": updated_at,
     "syncedAt": now_my.isoformat(),
+    "source": "shopify",
 }, merge=True)   # merge=True keeps existing fields like lastYearSale & dailyTarget
 
 print("🔥 Firestore updated successfully!")
