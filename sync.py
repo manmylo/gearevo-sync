@@ -20,131 +20,116 @@ headers = {
     "Content-Type": "application/json"
 }
 
-# ── STEP 0: Print granted scopes so we can verify ────────────
-print("🔑 Checking granted API scopes...")
-scope_resp = requests.get(
-    f"https://{SHOPIFY_STORE}/admin/api/2024-01/oauth/access_scopes.json",
-    headers=headers
-)
-if scope_resp.status_code == 200:
-    scopes = [s["handle"] for s in scope_resp.json().get("access_scopes", [])]
-    print(f"   Granted scopes: {scopes}")
-    required = {"read_orders"}
-    missing  = required - set(scopes)
-    if missing:
-        print(f"   ❌ MISSING required scopes: {missing}")
-        exit(1)
-    else:
-        print(f"   ✅ All required scopes present")
-else:
-    print(f"   ⚠️  Could not fetch scopes (status {scope_resp.status_code}) — continuing anyway")
-
 # ── Malaysia timezone (UTC+8) ────────────────────────────────
 MY_TZ = timezone(timedelta(hours=8))
 now_my = datetime.now(MY_TZ)
 today_str = now_my.strftime("%Y-%m-%d")
 
-# Window: 12:00:00 AM MY time → now (matches Shopify "Today" filter exactly)
 start_my  = datetime(now_my.year, now_my.month, now_my.day, 0, 0, 0, tzinfo=MY_TZ)
 start_utc = start_my.astimezone(timezone.utc)
 end_utc   = now_my.astimezone(timezone.utc)
 start_str = start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 end_str   = end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-print(f"\n📅 Date  : {today_str} (MY time)")
-print(f"   Window: 12:00:00 AM → {now_my.strftime('%I:%M:%S %p')} MYT")
-print(f"   UTC   : {start_str} → {end_str}")
+print(f"📅 {today_str} | Window: 12:00 AM → {now_my.strftime('%I:%M:%S %p')} MYT")
+print(f"   UTC: {start_str} → {end_str}")
 
-def fetch_all_orders(extra_params={}):
-    all_orders = []
-    url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json"
-    params = {
-        "created_at_min": start_str,
-        "created_at_max": end_str,
-        "limit": 250,
-        "fields": "id,subtotal_price,financial_status,cancel_reason,refunds",
-        **extra_params
-    }
-    while url:
-        response = requests.get(url, params=params, headers=headers)
-        if response.status_code != 200:
-            print(f"❌ Shopify API error {response.status_code}: {response.text}")
-            exit(1)
-        batch = response.json().get("orders", [])
-        all_orders.extend(batch)
-        print(f"   Got {len(batch)} orders (total so far: {len(all_orders)})")
-        link = response.headers.get("Link", "")
-        url = None
-        if 'rel="next"' in link:
-            for part in link.split(","):
-                if 'rel="next"' in part:
-                    url = part.split(";")[0].strip().strip("<>")
-                    params = {}
-                    break
-    return all_orders
+# ── STEP 1: Fetch orders WITHOUT specifying fields ────────────
+# Not using &fields= so Shopify returns the FULL order object.
+# This lets us see exactly what refund data is available.
+print(f"\n📦 Fetching full order objects (no field filter)...")
 
-# ── Fetch ALL orders in today's window ───────────────────────
-print(f"\n📦 Fetching orders...")
-all_orders = fetch_all_orders({
+all_orders = []
+url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json"
+params = {
+    "created_at_min": start_str,
+    "created_at_max": end_str,
     "status": "any",
-    "financial_status": "any"
-})
+    "financial_status": "any",
+    "limit": 250,
+}
 
-# Filter out cancelled orders
+while url:
+    response = requests.get(url, params=params, headers=headers)
+    if response.status_code != 200:
+        print(f"❌ Shopify API error {response.status_code}: {response.text}")
+        exit(1)
+    batch = response.json().get("orders", [])
+    all_orders.extend(batch)
+    print(f"   Page fetched: {len(batch)} orders (total: {len(all_orders)})")
+    link = response.headers.get("Link", "")
+    url = None
+    params = {}
+    if 'rel="next"' in link:
+        for part in link.split(","):
+            if 'rel="next"' in part:
+                url = part.split(";")[0].strip().strip("<>")
+                break
+
+# Filter cancelled
 active_orders = [o for o in all_orders if o.get("cancel_reason") is None]
-total_orders  = len(active_orders)
-cancelled     = len(all_orders) - total_orders
+print(f"   Active (non-cancelled): {len(active_orders)}")
 
-print(f"\n   Raw fetched  : {len(all_orders)} orders")
-print(f"   Cancelled    : {cancelled} (excluded)")
-print(f"   Active       : {total_orders} (included)")
+# ── STEP 2: Dump raw refund data for every order ──────────────
+# This is the most important output — paste this in chat so we
+# can see exactly what Shopify is returning for refunds.
+print(f"\n🔍 RAW REFUND DATA PER ORDER:")
+print(f"{'─'*70}")
 
-# ── Per-order breakdown ───────────────────────────────────────
-print(f"\n📋 Per-order breakdown:")
 gross_sale    = 0.0
 total_returns = 0.0
 
 for o in active_orders:
     oid      = o["id"]
-    subtotal = float(o.get("subtotal_price", 0))    # original line items (gross)
-    refunds_on_order = o.get("refunds", [])
+    subtotal = float(o.get("subtotal_price", 0))
+    refunds  = o.get("refunds", [])
 
-    # Sum refund_line_items[].subtotal — this is exactly Shopify's "Returns" figure
-    # (pre-tax line item refund amounts only, excludes shipping refunds)
-    order_returns = sum(
-        float(rli.get("subtotal", 0))
-        for refund in refunds_on_order
-        for rli in refund.get("refund_line_items", [])
-    )
+    print(f"\n  Order #{oid}")
+    print(f"    subtotal_price         : {o.get('subtotal_price')}")
+    print(f"    current_subtotal_price : {o.get('current_subtotal_price')}")
+    print(f"    total_price            : {o.get('total_price')}")
+    print(f"    current_total_price    : {o.get('current_total_price')}")
+    print(f"    financial_status       : {o.get('financial_status')}")
+    print(f"    refunds count          : {len(refunds)}")
+
+    order_returns = 0.0
+    for ri, refund in enumerate(refunds):
+        rlis = refund.get("refund_line_items", [])
+        transactions = refund.get("transactions", [])
+        print(f"    refund[{ri}]:")
+        print(f"      refund_line_items count : {len(rlis)}")
+        for rli in rlis:
+            print(f"        rli subtotal={rli.get('subtotal')} qty={rli.get('quantity')} line_item_id={rli.get('line_item_id')}")
+            order_returns += float(rli.get("subtotal", 0))
+        print(f"      transactions count      : {len(transactions)}")
+        for tx in transactions:
+            print(f"        tx amount={tx.get('amount')} kind={tx.get('kind')} status={tx.get('status')}")
 
     order_net = subtotal - order_returns
     gross_sale    += subtotal
     total_returns += order_returns
+    print(f"    → gross={subtotal:.2f} | returns={order_returns:.2f} | net={order_net:.2f}")
 
-    num_refund_events = len(refunds_on_order)
-    print(f"   #{oid} | gross={subtotal:.2f} | returns={order_returns:.2f} | net={order_net:.2f} | status={o.get('financial_status')} | refund_events={num_refund_events}")
-
+print(f"\n{'─'*70}")
+print(f"📊 TOTALS:")
 net_sale = gross_sale - total_returns
-
-print(f"\n📊 Summary:")
-print(f"   Gross sales : RM{gross_sale:.2f}")
-print(f"   Returns     : -RM{total_returns:.2f}")
-print(f"   Net sales   : RM{net_sale:.2f}   ← should match Shopify Analytics")
-print(f"   Orders      : {total_orders}")
+print(f"   Gross  : RM{gross_sale:.2f}")
+print(f"   Returns: -RM{total_returns:.2f}")
+print(f"   Net    : RM{net_sale:.2f}  ← compare this to Shopify Analytics")
+print(f"   Orders : {len(active_orders)}")
 
 updated_at = now_my.strftime("%H:%M:%S")
 
-# ── Push to Firestore (merge — preserves lastYearSale & dailyTarget) ──
+# ── Push to Firestore ─────────────────────────────────────────
 doc_ref = db.collection("sales").document("today")
 doc_ref.set({
     "currentSale":  round(net_sale, 2),
     "grossSale":    round(gross_sale, 2),
     "totalRefunds": round(total_returns, 2),
-    "totalOrders":  total_orders,
+    "totalOrders":  len(active_orders),
     "updatedAt":    updated_at,
     "syncedAt":     now_my.isoformat(),
     "source":       "shopify",
 }, merge=True)
 
-print(f"\n✅ Firestore updated!")
-print(f"🔥 Net RM{net_sale:.2f} | Gross RM{gross_sale:.2f} | Returns -RM{total_returns:.2f} | Orders {total_orders}")
+print(f"\n✅ Firestore synced!")
