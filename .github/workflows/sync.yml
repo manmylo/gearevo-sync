@@ -1,9 +1,12 @@
 name: Sync Shopify to Firestore
 
+# Last activated: 2026-04-11
 on:
   schedule:
     - cron: '*/15 * * * *'   # every 15 minutes
   workflow_dispatch:          # allow manual trigger from GitHub UI
+  push:
+    branches: [main]          # re-activates schedule on every push
 
 jobs:
   sync:
