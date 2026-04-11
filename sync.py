@@ -69,35 +69,34 @@ all_orders = fetch_all_orders({
 
 # Filter out cancelled orders
 active_orders = [o for o in all_orders if o.get("cancel_reason") is None]
+total_orders  = len(active_orders)
+gross_sale    = sum(float(o.get("total_price", 0)) for o in active_orders)
 
-total_orders = len(active_orders)
-gross_sale   = sum(float(o.get("total_price", 0)) for o in active_orders)
-
-# ── Calculate total refunds ───────────────────────────────────
-total_refunds = 0.0
+# ── Calculate returns using refund_line_items subtotal ────────
+# This matches Shopify's "Returns" figure exactly
+total_returns = 0.0
 for order in active_orders:
     for refund in order.get("refunds", []):
-        for transaction in refund.get("transactions", []):
-            # Only count successful refund transactions
-            if transaction.get("kind") == "refund" and transaction.get("status") == "success":
-                total_refunds += float(transaction.get("amount", 0))
+        for item in refund.get("refund_line_items", []):
+            subtotal = float(item.get("subtotal", 0))
+            total_returns += subtotal
 
-net_sale = gross_sale - total_refunds
+net_sale = gross_sale - total_returns
 
 print(f"\n📊 Results:")
-print(f"   Total orders (excl. cancelled): {total_orders}")
-print(f"   Gross sale:   RM{gross_sale:.2f}")
-print(f"   Refunds:     -RM{total_refunds:.2f}")
-print(f"   Net sale:     RM{net_sale:.2f}")
+print(f"   Total orders : {total_orders}")
+print(f"   Gross sale   : RM{gross_sale:.2f}")
+print(f"   Returns      : -RM{total_returns:.2f}")
+print(f"   Net sale     : RM{net_sale:.2f}")
 
 updated_at = now_my.strftime("%H:%M:%S")
 
-# ── Push to Firestore ────────────────────────────────────────
+# ── Push to Firestore ─────────────────────────────────────────
 doc_ref = db.collection("sales").document("today")
 doc_ref.set({
-    "currentSale":  round(net_sale, 2),      # net sale as the main figure
-    "grossSale":    round(gross_sale, 2),     # gross for reference
-    "totalRefunds": round(total_refunds, 2),  # refunds for reference
+    "currentSale":  round(net_sale, 2),
+    "grossSale":    round(gross_sale, 2),
+    "totalRefunds": round(total_returns, 2),
     "totalOrders":  total_orders,
     "updatedAt":    updated_at,
     "syncedAt":     now_my.isoformat(),
@@ -105,4 +104,4 @@ doc_ref.set({
 }, merge=True)
 
 print(f"\n✅ Synced to Firestore!")
-print(f"🔥 Net: RM{net_sale:.2f} | Gross: RM{gross_sale:.2f} | Refunds: RM{total_refunds:.2f} | Orders: {total_orders}")
+print(f"🔥 Net: RM{net_sale:.2f} | Gross: RM{gross_sale:.2f} | Returns: -RM{total_returns:.2f} | Orders: {total_orders}")
