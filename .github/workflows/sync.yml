@@ -1,9 +1,10 @@
 name: Sync Shopify to Firestore
 
+# Last activated: 2026-04-11
 on:
-  workflow_dispatch:          # manual trigger from GitHub UI + cron-job.org
+  workflow_dispatch:
   push:
-    branches: [main]          # also runs on every push
+    branches: [main]
 
 jobs:
   sync:
@@ -17,7 +18,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests firebase-admin
+        run: pip install requests firebase-admin pandas openpyxl
 
       - name: Run sync script
         env:
