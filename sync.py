@@ -1,8 +1,9 @@
 import os
 import json
+import time
 import requests
 import pandas as pd
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -34,27 +35,32 @@ end_str   = end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 print(f"📅 {today_str} | Window: 12:00 AM → {now_my.strftime('%I:%M:%S %p')} MYT")
 
-# ── STEP 1: Read Excel for today's lastYearSale & dailyTarget ─
+# ── STEP 1: Read Excel for lastYearSale & dailyTarget ─────────
+# Load the full DataFrame once — reused for both today + historical backfill
 last_year_sale = 0.0
 daily_target   = 0.0
+excel_df       = None
+date_col       = None
+lastyear_col   = None
+target_col     = None
 
 try:
-    df = pd.read_excel("Sales_and_Target.xlsx")
-    df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
+    excel_df = pd.read_excel("Sales_and_Target.xlsx")
+    excel_df.columns = excel_df.columns.str.strip().str.lower().str.replace(" ", "_")
 
-    date_col     = next((c for c in df.columns if "date" in c), None)
-    lastyear_col = next((c for c in df.columns if "last" in c and "year" in c or "last_year" in c), None)
-    target_col   = next((c for c in df.columns if "target" in c), None)
+    date_col     = next((c for c in excel_df.columns if "date" in c), None)
+    lastyear_col = next((c for c in excel_df.columns if "last" in c and "year" in c or "last_year" in c), None)
+    target_col   = next((c for c in excel_df.columns if "target" in c), None)
 
-    print(f"   Excel columns  : {list(df.columns)}")
+    print(f"   Excel columns  : {list(excel_df.columns)}")
     print(f"   Date col       : {date_col}")
     print(f"   Last year col  : {lastyear_col}")
     print(f"   Target col     : {target_col}")
 
     if date_col and lastyear_col:
-        df[date_col] = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+        excel_df[date_col] = pd.to_datetime(excel_df[date_col], dayfirst=True, errors="coerce")
         today_dt = pd.Timestamp(now_my.year, now_my.month, now_my.day)
-        row = df[df[date_col] == today_dt]
+        row = excel_df[excel_df[date_col] == today_dt]
 
         if not row.empty:
             last_year_sale = float(row[lastyear_col].values[0]) if pd.notna(row[lastyear_col].values[0]) else 0.0
@@ -64,7 +70,7 @@ try:
                 if pd.notna(target_val) and float(target_val) > 0:
                     daily_target = float(target_val)
                 else:
-                    past = df[(df[date_col] <= today_dt) & df[target_col].notna() & (df[target_col] > 0)]
+                    past = excel_df[(excel_df[date_col] <= today_dt) & excel_df[target_col].notna() & (excel_df[target_col] > 0)]
                     if not past.empty:
                         daily_target = float(past.iloc[-1][target_col])
                         print(f"   ⚠️  No target for today — using last known: RM{daily_target:.2f}")
@@ -80,7 +86,7 @@ except FileNotFoundError:
 except Exception as e:
     print(f"   ❌ Excel read error: {e}")
 
-# ── STEP 2: Fetch Shopify orders ──────────────────────────────
+# ── STEP 2: Fetch Shopify orders (today) ──────────────────────
 print(f"\n📦 Fetching Shopify orders...")
 
 all_orders = []
@@ -153,7 +159,7 @@ print(f"   Target      : RM{daily_target:.2f}")
 
 updated_at = now_my.strftime("%H:%M:%S")
 
-# ── STEP 4: Push to Firestore (no rounding — keep 2 decimal places as-is) ──
+# ── STEP 4: Push today to Firestore ──────────────────────────
 doc_ref = db.collection("sales").document("today")
 doc_ref.set({
     "currentSale":  float(f"{net_sale:.2f}"),
@@ -167,5 +173,185 @@ doc_ref.set({
     "source":       "shopify",
 }, merge=False)
 
-print(f"\n✅ Firestore synced!")
+# Also save today into the daily collection so historical data is complete
+today_daily_ref = db.collection("sales").document("daily").collection("days").document(today_str)
+today_daily_ref.set({
+    "date":         today_str,
+    "currentSale":  float(f"{net_sale:.2f}"),
+    "grossSale":    float(f"{gross_sale:.2f}"),
+    "totalRefunds": float(f"{total_returns:.2f}"),
+    "totalOrders":  total_orders,
+    "lastYearSale": float(f"{last_year_sale:.2f}"),
+    "dailyTarget":  float(f"{daily_target:.2f}"),
+    "syncedAt":     now_my.isoformat(),
+    "source":       "shopify",
+}, merge=False)
+
+print(f"\n✅ Firestore synced (today)!")
 print(f"🔥 Net RM{net_sale:.2f} | LastYear RM{last_year_sale:.2f} | Target RM{daily_target:.2f} | Orders {total_orders}")
+
+
+# ══════════════════════════════════════════════════════════════
+# ── STEP 5: Historical backfill (27/3/2026 → 27/5/2026) ─────
+# Only fetches days that are missing from Firestore.
+# Skips future dates. Uses same net-sale logic as today's sync.
+# ══════════════════════════════════════════════════════════════
+
+HISTORY_START = date(2026, 3, 27)
+HISTORY_END   = date(2026, 5, 27)
+
+print(f"\n{'═'*65}")
+print(f"📜 HISTORICAL BACKFILL: {HISTORY_START} → {HISTORY_END}")
+print(f"{'═'*65}")
+
+
+def excel_lookup(lookup_date):
+    """Return (lastYearSale, dailyTarget) from the Excel DataFrame for a given date."""
+    ly = 0.0
+    tgt = 0.0
+    if excel_df is None or date_col is None or lastyear_col is None:
+        return ly, tgt
+
+    dt = pd.Timestamp(lookup_date.year, lookup_date.month, lookup_date.day)
+    row = excel_df[excel_df[date_col] == dt]
+
+    if not row.empty:
+        val = row[lastyear_col].values[0]
+        ly = float(val) if pd.notna(val) else 0.0
+
+        if target_col:
+            tval = row[target_col].values[0]
+            if pd.notna(tval) and float(tval) > 0:
+                tgt = float(tval)
+            else:
+                # Fall back to last known target
+                past = excel_df[(excel_df[date_col] <= dt) & excel_df[target_col].notna() & (excel_df[target_col] > 0)]
+                if not past.empty:
+                    tgt = float(past.iloc[-1][target_col])
+    return ly, tgt
+
+
+def fetch_shopify_orders_for_date(target_date):
+    """Fetch all Shopify orders for a single MYT day. Returns (net, gross, refunds, order_count)."""
+    day_start_my  = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=MY_TZ)
+    day_end_my    = day_start_my + timedelta(days=1)
+    day_start_utc = day_start_my.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    day_end_utc   = day_end_my.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    orders = []
+    url    = f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json"
+    p      = {
+        "created_at_min": day_start_utc,
+        "created_at_max": day_end_utc,
+        "status":           "any",
+        "financial_status": "any",
+        "limit":            250,
+        "fields":           "id,order_number,subtotal_price,financial_status,cancel_reason,refunds",
+    }
+
+    while url:
+        resp = requests.get(url, params=p, headers=headers)
+        if resp.status_code == 429:
+            # Rate limited — wait and retry
+            retry_after = float(resp.headers.get("Retry-After", 2))
+            print(f"      ⏳ Rate limited, waiting {retry_after}s...")
+            time.sleep(retry_after)
+            continue
+        if resp.status_code != 200:
+            print(f"      ❌ Shopify API error {resp.status_code}: {resp.text}")
+            return None
+        batch = resp.json().get("orders", [])
+        orders.extend(batch)
+        link = resp.headers.get("Link", "")
+        url  = None
+        p    = {}
+        if 'rel="next"' in link:
+            for part in link.split(","):
+                if 'rel="next"' in part:
+                    url = part.split(";")[0].strip().strip("<>")
+                    break
+
+    # Calculate — same logic as today's sync
+    active = [o for o in orders if o.get("cancel_reason") is None]
+    gross  = 0.0
+    refunds_total = 0.0
+    for o in active:
+        subtotal = float(o.get("subtotal_price", 0))
+        order_refunds = sum(
+            float(rli.get("subtotal", 0))
+            for refund in o.get("refunds", [])
+            for rli in refund.get("refund_line_items", [])
+        )
+        gross += subtotal
+        refunds_total += order_refunds
+
+    net = gross - refunds_total
+    return net, gross, refunds_total, len(active)
+
+
+# ── Loop through each date in range ──────────────────────────
+today_date = now_my.date()
+current = HISTORY_START
+synced  = 0
+skipped = 0
+
+while current <= HISTORY_END:
+    ds = current.strftime("%Y-%m-%d")
+
+    # Skip future dates (can't fetch orders that haven't happened yet)
+    if current > today_date:
+        print(f"   ⏭  {ds} — future date, stopping backfill")
+        break
+
+    # Skip today — already synced in Step 4
+    if current == today_date:
+        print(f"   ⏭  {ds} — today (already synced above)")
+        current += timedelta(days=1)
+        continue
+
+    # Check if this date already exists in Firestore
+    doc_ref = db.collection("sales").document("daily").collection("days").document(ds)
+    doc = doc_ref.get()
+    if doc.exists:
+        skipped += 1
+        current += timedelta(days=1)
+        continue
+
+    # Fetch from Shopify
+    print(f"   📦 {ds} — fetching from Shopify...", end=" ")
+    result = fetch_shopify_orders_for_date(current)
+
+    if result is None:
+        print("FAILED — skipping")
+        current += timedelta(days=1)
+        continue
+
+    net, gross, refunds, order_count = result
+
+    # Excel lookup
+    ly, tgt = excel_lookup(current)
+
+    # Write to Firestore
+    doc_ref.set({
+        "date":         ds,
+        "currentSale":  float(f"{net:.2f}"),
+        "grossSale":    float(f"{gross:.2f}"),
+        "totalRefunds": float(f"{refunds:.2f}"),
+        "totalOrders":  order_count,
+        "lastYearSale": float(f"{ly:.2f}"),
+        "dailyTarget":  float(f"{tgt:.2f}"),
+        "syncedAt":     now_my.isoformat(),
+        "source":       "shopify",
+    })
+
+    print(f"✅ Net RM{net:.2f} | Orders {order_count} | LY RM{ly:.2f} | Tgt RM{tgt:.2f}")
+    synced += 1
+
+    # Small delay to respect Shopify API rate limits (2 calls/sec)
+    time.sleep(0.5)
+
+    current += timedelta(days=1)
+
+print(f"\n{'═'*65}")
+print(f"📜 Backfill complete: {synced} days synced, {skipped} days already existed")
+print(f"{'═'*65}")
