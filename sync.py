@@ -97,7 +97,7 @@ params = {
     "status":           "any",
     "financial_status": "any",
     "limit":            250,
-    "fields":           "id,order_number,subtotal_price,financial_status,cancel_reason,refunds",
+    "fields":           "id,order_number,subtotal_price,total_discounts,financial_status,cancel_reason,refunds",
 }
 
 while url:
@@ -145,21 +145,30 @@ for o in active_orders:
     refund_flag = " ↩" if order_returns > 0 else ""
     print(f"#{order_num:<9} {subtotal:>12.2f} {order_returns:>12.2f} {order_net:>12.2f}  {o.get('financial_status','')}{refund_flag}")
 
-# Gross sale = subtotal of ALL orders (including cancelled)
-gross_sale = sum(float(o.get("subtotal_price", 0)) for o in all_orders)
+# Gross sale = (subtotal + discounts) of ALL orders (including cancelled)
+# subtotal_price is after discounts, so we add total_discounts back to get true gross
+gross_sale = sum(
+    float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0))
+    for o in all_orders
+)
+total_discounts = sum(float(o.get("total_discounts", 0)) for o in all_orders)
 
 cancelled_orders = [o for o in all_orders if o.get("cancel_reason") is not None]
-cancelled_total  = sum(float(o.get("subtotal_price", 0)) for o in cancelled_orders)
+cancelled_total  = sum(
+    float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0))
+    for o in cancelled_orders
+)
 
 print(f"{'─'*75}")
 print(f"{'ACTIVE':<10} {current_sale + total_returns:>12.2f} {total_returns:>12.2f} {current_sale:>12.2f}")
 if cancelled_orders:
     print(f"{'CANCELLED':<10} {cancelled_total:>12.2f} {'—':>12} {'—':>12}  ({len(cancelled_orders)} orders)")
-print(f"{'GROSS':<10} {gross_sale:>12.2f}")
+print(f"{'GROSS':<10} {gross_sale:>12.2f}  (incl. discounts RM{total_discounts:.2f})")
 print(f"{'─'*75}")
 
 print(f"\n📊 Summary:")
-print(f"   Gross       : RM{gross_sale:.2f}  ← all orders incl. cancelled")
+print(f"   Gross       : RM{gross_sale:.2f}  ← all orders incl. cancelled + discounts")
+print(f"   Discounts   : RM{total_discounts:.2f}")
 print(f"   Cancelled   : RM{cancelled_total:.2f}  ({len(cancelled_orders)} orders)")
 print(f"   Returns     : -RM{total_returns:.2f}")
 print(f"   Current     : RM{current_sale:.2f}  ← active orders minus returns")
@@ -255,7 +264,7 @@ def fetch_shopify_orders_for_date(target_date):
         "status":           "any",
         "financial_status": "any",
         "limit":            250,
-        "fields":           "id,order_number,subtotal_price,financial_status,cancel_reason,refunds",
+        "fields":           "id,order_number,subtotal_price,total_discounts,financial_status,cancel_reason,refunds",
     }
 
     while url:
@@ -281,8 +290,11 @@ def fetch_shopify_orders_for_date(target_date):
                     break
 
     # Calculate — same logic as today's sync
-    # Gross = subtotal of ALL orders (including cancelled)
-    gross = sum(float(o.get("subtotal_price", 0)) for o in orders)
+    # Gross = (subtotal + discounts) of ALL orders (including cancelled)
+    gross = sum(
+        float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0))
+        for o in orders
+    )
 
     # Current = active orders minus refunds
     active = [o for o in orders if o.get("cancel_reason") is None]
