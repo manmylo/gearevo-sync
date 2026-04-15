@@ -123,11 +123,11 @@ total_orders  = len(active_orders)
 print(f"   Active orders  : {total_orders} (cancelled excluded: {len(all_orders) - total_orders})")
 
 # ── STEP 3: Per-order breakdown + totals ─────────────────────
-print(f"\n{'─'*65}")
-print(f"{'Order':<10} {'Gross':>12} {'Returns':>12} {'Net':>12}  Status")
-print(f"{'─'*65}")
+print(f"\n{'─'*75}")
+print(f"{'Order':<10} {'Subtotal':>12} {'Returns':>12} {'Net':>12}  Status")
+print(f"{'─'*75}")
 
-gross_sale    = 0.0
+current_sale  = 0.0
 total_returns = 0.0
 
 for o in active_orders:
@@ -139,21 +139,30 @@ for o in active_orders:
         for rli in refund.get("refund_line_items", [])
     )
     order_net     = subtotal - order_returns
-    gross_sale    += subtotal
+    current_sale  += order_net
     total_returns += order_returns
 
     refund_flag = " ↩" if order_returns > 0 else ""
     print(f"#{order_num:<9} {subtotal:>12.2f} {order_returns:>12.2f} {order_net:>12.2f}  {o.get('financial_status','')}{refund_flag}")
 
-print(f"{'─'*65}")
-net_sale = gross_sale - total_returns
-print(f"{'TOTAL':<10} {gross_sale:>12.2f} {total_returns:>12.2f} {net_sale:>12.2f}")
-print(f"{'─'*65}")
+# Gross sale = subtotal of ALL orders (including cancelled)
+gross_sale = sum(float(o.get("subtotal_price", 0)) for o in all_orders)
+
+cancelled_orders = [o for o in all_orders if o.get("cancel_reason") is not None]
+cancelled_total  = sum(float(o.get("subtotal_price", 0)) for o in cancelled_orders)
+
+print(f"{'─'*75}")
+print(f"{'ACTIVE':<10} {current_sale + total_returns:>12.2f} {total_returns:>12.2f} {current_sale:>12.2f}")
+if cancelled_orders:
+    print(f"{'CANCELLED':<10} {cancelled_total:>12.2f} {'—':>12} {'—':>12}  ({len(cancelled_orders)} orders)")
+print(f"{'GROSS':<10} {gross_sale:>12.2f}")
+print(f"{'─'*75}")
 
 print(f"\n📊 Summary:")
-print(f"   Gross       : RM{gross_sale:.2f}")
+print(f"   Gross       : RM{gross_sale:.2f}  ← all orders incl. cancelled")
+print(f"   Cancelled   : RM{cancelled_total:.2f}  ({len(cancelled_orders)} orders)")
 print(f"   Returns     : -RM{total_returns:.2f}")
-print(f"   Net         : RM{net_sale:.2f}  ← pushed to Firestore")
+print(f"   Current     : RM{current_sale:.2f}  ← active orders minus returns")
 print(f"   Last Year   : RM{last_year_sale:.2f}")
 print(f"   Target      : RM{daily_target:.2f}")
 
@@ -162,7 +171,7 @@ updated_at = now_my.strftime("%H:%M:%S")
 # ── STEP 4: Push today to Firestore ──────────────────────────
 doc_ref = db.collection("sales").document("today")
 doc_ref.set({
-    "currentSale":  float(f"{net_sale:.2f}"),
+    "currentSale":  float(f"{current_sale:.2f}"),
     "grossSale":    float(f"{gross_sale:.2f}"),
     "totalRefunds": float(f"{total_returns:.2f}"),
     "totalOrders":  total_orders,
@@ -177,7 +186,7 @@ doc_ref.set({
 today_daily_ref = db.collection("sales").document("daily").collection("days").document(today_str)
 today_daily_ref.set({
     "date":         today_str,
-    "currentSale":  float(f"{net_sale:.2f}"),
+    "currentSale":  float(f"{current_sale:.2f}"),
     "grossSale":    float(f"{gross_sale:.2f}"),
     "totalRefunds": float(f"{total_returns:.2f}"),
     "totalOrders":  total_orders,
@@ -188,7 +197,7 @@ today_daily_ref.set({
 }, merge=False)
 
 print(f"\n✅ Firestore synced (today)!")
-print(f"🔥 Net RM{net_sale:.2f} | LastYear RM{last_year_sale:.2f} | Target RM{daily_target:.2f} | Orders {total_orders}")
+print(f"🔥 Gross RM{gross_sale:.2f} | Current RM{current_sale:.2f} | LastYear RM{last_year_sale:.2f} | Target RM{daily_target:.2f} | Orders {total_orders}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -272,8 +281,12 @@ def fetch_shopify_orders_for_date(target_date):
                     break
 
     # Calculate — same logic as today's sync
+    # Gross = subtotal of ALL orders (including cancelled)
+    gross = sum(float(o.get("subtotal_price", 0)) for o in orders)
+
+    # Current = active orders minus refunds
     active = [o for o in orders if o.get("cancel_reason") is None]
-    gross  = 0.0
+    current_total = 0.0
     refunds_total = 0.0
     for o in active:
         subtotal = float(o.get("subtotal_price", 0))
@@ -282,11 +295,10 @@ def fetch_shopify_orders_for_date(target_date):
             for refund in o.get("refunds", [])
             for rli in refund.get("refund_line_items", [])
         )
-        gross += subtotal
+        current_total += subtotal - order_refunds
         refunds_total += order_refunds
 
-    net = gross - refunds_total
-    return net, gross, refunds_total, len(active)
+    return current_total, gross, refunds_total, len(active)
 
 
 # ── Loop through each date in range ──────────────────────────
@@ -344,7 +356,7 @@ while current <= HISTORY_END:
         "source":       "shopify",
     })
 
-    print(f"✅ Net RM{net:.2f} | Orders {order_count} | LY RM{ly:.2f} | Tgt RM{tgt:.2f}")
+    print(f"✅ Gross RM{gross:.2f} | Current RM{net:.2f} | Orders {order_count} | LY RM{ly:.2f} | Tgt RM{tgt:.2f}")
     synced += 1
 
     # Small delay to respect Shopify API rate limits (2 calls/sec)
