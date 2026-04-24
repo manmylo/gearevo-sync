@@ -35,14 +35,15 @@ end_str   = end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 print(f"📅 {today_str} | Window: 12:00 AM → {now_my.strftime('%I:%M:%S %p')} MYT")
 
-# ── STEP 1: Read Excel for lastYearSale & dailyTarget ─────────
-# Load the full DataFrame once — reused for both today + historical backfill
-last_year_sale = 0.0
-daily_target   = 0.0
-excel_df       = None
-date_col       = None
-lastyear_col   = None
-target_col     = None
+# ── STEP 1: Read Excel for lastYearSale, dailyForecast & dailyTarget ──
+last_year_sale  = 0.0
+daily_target    = 0.0
+daily_forecast  = 0.0
+excel_df        = None
+date_col        = None
+lastyear_col    = None
+target_col      = None
+forecast_col    = None
 
 try:
     excel_df = pd.read_excel("Sales_and_Target.xlsx")
@@ -51,10 +52,12 @@ try:
     date_col     = next((c for c in excel_df.columns if "date" in c), None)
     lastyear_col = next((c for c in excel_df.columns if "last" in c and "year" in c or "last_year" in c), None)
     target_col   = next((c for c in excel_df.columns if "target" in c), None)
+    forecast_col = next((c for c in excel_df.columns if "forecast" in c), None)
 
     print(f"   Excel columns  : {list(excel_df.columns)}")
     print(f"   Date col       : {date_col}")
     print(f"   Last year col  : {lastyear_col}")
+    print(f"   Forecast col   : {forecast_col}")
     print(f"   Target col     : {target_col}")
 
     if date_col and lastyear_col:
@@ -64,6 +67,10 @@ try:
 
         if not row.empty:
             last_year_sale = float(row[lastyear_col].values[0]) if pd.notna(row[lastyear_col].values[0]) else 0.0
+
+            if forecast_col:
+                fval = row[forecast_col].values[0]
+                daily_forecast = float(fval) if pd.notna(fval) and float(fval) > 0 else 0.0
 
             if target_col:
                 target_val = row[target_col].values[0]
@@ -75,7 +82,7 @@ try:
                         daily_target = float(past.iloc[-1][target_col])
                         print(f"   ⚠️  No target for today — using last known: RM{daily_target:.2f}")
 
-            print(f"   ✅ Excel match : LastYear=RM{last_year_sale:.2f} | Target=RM{daily_target:.2f}")
+            print(f"   ✅ Excel match : LastYear=RM{last_year_sale:.2f} | Forecast=RM{daily_forecast:.2f} | Target=RM{daily_target:.2f}")
         else:
             print(f"   ⚠️  No row found for {today_str} in Excel — using 0")
     else:
@@ -145,8 +152,6 @@ for o in active_orders:
     refund_flag = " ↩" if order_returns > 0 else ""
     print(f"#{order_num:<9} {subtotal:>12.2f} {order_returns:>12.2f} {order_net:>12.2f}  {o.get('financial_status','')}{refund_flag}")
 
-# Gross sale = (subtotal + discounts) of ALL orders (including cancelled)
-# subtotal_price is after discounts, so we add total_discounts back to get true gross
 gross_sale = sum(
     float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0))
     for o in all_orders
@@ -173,6 +178,7 @@ print(f"   Cancelled   : RM{cancelled_total:.2f}  ({len(cancelled_orders)} order
 print(f"   Returns     : -RM{total_returns:.2f}")
 print(f"   Current     : RM{current_sale:.2f}  ← active orders minus returns")
 print(f"   Last Year   : RM{last_year_sale:.2f}")
+print(f"   Forecast    : RM{daily_forecast:.2f}")
 print(f"   Target      : RM{daily_target:.2f}")
 
 updated_at = now_my.strftime("%H:%M:%S")
@@ -180,42 +186,108 @@ updated_at = now_my.strftime("%H:%M:%S")
 # ── STEP 4: Push today to Firestore ──────────────────────────
 doc_ref = db.collection("sales").document("today")
 doc_ref.set({
-    "currentSale":  float(f"{current_sale:.2f}"),
-    "grossSale":    float(f"{gross_sale:.2f}"),
-    "totalRefunds": float(f"{total_returns:.2f}"),
-    "totalOrders":  total_orders,
-    "lastYearSale": float(f"{last_year_sale:.2f}"),
-    "dailyTarget":  float(f"{daily_target:.2f}"),
-    "updatedAt":    updated_at,
-    "syncedAt":     now_my.isoformat(),
-    "source":       "shopify",
+    "currentSale":   float(f"{current_sale:.2f}"),
+    "grossSale":     float(f"{gross_sale:.2f}"),
+    "totalRefunds":  float(f"{total_returns:.2f}"),
+    "totalOrders":   total_orders,
+    "lastYearSale":  float(f"{last_year_sale:.2f}"),
+    "dailyForecast": float(f"{daily_forecast:.2f}"),
+    "dailyTarget":   float(f"{daily_target:.2f}"),
+    "updatedAt":     updated_at,
+    "syncedAt":      now_my.isoformat(),
+    "source":        "shopify",
 }, merge=False)
 
-# Also save today into the daily collection so historical data is complete
 today_daily_ref = db.collection("sales").document("daily").collection("days").document(today_str)
 today_daily_ref.set({
-    "date":         today_str,
-    "currentSale":  float(f"{current_sale:.2f}"),
-    "grossSale":    float(f"{gross_sale:.2f}"),
-    "totalRefunds": float(f"{total_returns:.2f}"),
-    "totalOrders":  total_orders,
-    "lastYearSale": float(f"{last_year_sale:.2f}"),
-    "dailyTarget":  float(f"{daily_target:.2f}"),
-    "syncedAt":     now_my.isoformat(),
-    "source":       "shopify",
+    "date":          today_str,
+    "currentSale":   float(f"{current_sale:.2f}"),
+    "grossSale":     float(f"{gross_sale:.2f}"),
+    "totalRefunds":  float(f"{total_returns:.2f}"),
+    "totalOrders":   total_orders,
+    "lastYearSale":  float(f"{last_year_sale:.2f}"),
+    "dailyForecast": float(f"{daily_forecast:.2f}"),
+    "dailyTarget":   float(f"{daily_target:.2f}"),
+    "syncedAt":      now_my.isoformat(),
+    "source":        "shopify",
 }, merge=False)
 
 print(f"\n✅ Firestore synced (today)!")
-print(f"🔥 Gross RM{gross_sale:.2f} | Current RM{current_sale:.2f} | LastYear RM{last_year_sale:.2f} | Target RM{daily_target:.2f} | Orders {total_orders}")
+print(f"🔥 Gross RM{gross_sale:.2f} | Current RM{current_sale:.2f} | LY RM{last_year_sale:.2f} | Forecast RM{daily_forecast:.2f} | Target RM{daily_target:.2f} | Orders {total_orders}")
 
 
 # ══════════════════════════════════════════════════════════════
-# ── STEP 5: Historical backfill (27/3/2026 → 27/5/2026) ─────
-# Only fetches days that are missing from Firestore.
+# ── STEP 5: Sync ALL Excel rows to Firestore ─────────────────
+# Pushes lastYearSale, dailyForecast, dailyTarget for EVERY row
+# in the Excel file (past AND future dates).
+# For past dates that already have Shopify data, merges the
+# Excel fields — does NOT overwrite currentSale/orders.
+# For future dates (no Shopify data), creates the doc with
+# Excel data so the chart can show forecast/lastYear ahead.
+# ══════════════════════════════════════════════════════════════
+
+print(f"\n{'═'*65}")
+print(f"📊 EXCEL SYNC: Pushing all Excel rows to Firestore")
+print(f"{'═'*65}")
+
+excel_synced = 0
+
+if excel_df is not None and date_col is not None and lastyear_col is not None:
+    for _, erow in excel_df.iterrows():
+        row_date = erow[date_col]
+        if pd.isna(row_date):
+            continue
+
+        ds = row_date.strftime("%Y-%m-%d")
+
+        # Skip today — already synced in Step 4
+        if ds == today_str:
+            continue
+
+        # Build Excel fields
+        ly  = float(erow[lastyear_col]) if lastyear_col and pd.notna(erow[lastyear_col]) else 0.0
+        fc  = float(erow[forecast_col]) if forecast_col and pd.notna(erow[forecast_col]) else 0.0
+        tgt = float(erow[target_col])   if target_col   and pd.notna(erow[target_col])   else 0.0
+
+        excel_patch = {
+            "date":          ds,
+            "lastYearSale":  float(f"{ly:.2f}"),
+            "dailyForecast": float(f"{fc:.2f}"),
+            "dailyTarget":   float(f"{tgt:.2f}"),
+        }
+
+        doc_ref = db.collection("sales").document("daily").collection("days").document(ds)
+        doc = doc_ref.get()
+
+        if doc.exists:
+            # Document exists (has Shopify data) — merge Excel fields only
+            doc_ref.set(excel_patch, merge=True)
+        else:
+            # No Shopify data yet — create doc with Excel data + zeroed Shopify fields
+            excel_patch.update({
+                "currentSale":  0.0,
+                "grossSale":    0.0,
+                "totalRefunds": 0.0,
+                "totalOrders":  0,
+                "syncedAt":     now_my.isoformat(),
+                "source":       "excel",
+            })
+            doc_ref.set(excel_patch)
+
+        excel_synced += 1
+
+    print(f"   ✅ {excel_synced} Excel rows synced to Firestore")
+else:
+    print(f"   ⚠️  No Excel data available — skipping")
+
+
+# ══════════════════════════════════════════════════════════════
+# ── STEP 6: Historical Shopify backfill (26/3/2026 → 27/5/2026)
+# Only fetches days missing Shopify data from Firestore.
 # Skips future dates. Uses same net-sale logic as today's sync.
 # ══════════════════════════════════════════════════════════════
 
-HISTORY_START = date(2026, 3, 27)
+HISTORY_START = date(2026, 3, 26)   # Day 62
 HISTORY_END   = date(2026, 5, 27)
 
 print(f"\n{'═'*65}")
@@ -224,11 +296,12 @@ print(f"{'═'*65}")
 
 
 def excel_lookup(lookup_date):
-    """Return (lastYearSale, dailyTarget) from the Excel DataFrame for a given date."""
-    ly = 0.0
+    """Return (lastYearSale, dailyForecast, dailyTarget) from the Excel DataFrame."""
+    ly  = 0.0
+    fc  = 0.0
     tgt = 0.0
     if excel_df is None or date_col is None or lastyear_col is None:
-        return ly, tgt
+        return ly, fc, tgt
 
     dt = pd.Timestamp(lookup_date.year, lookup_date.month, lookup_date.day)
     row = excel_df[excel_df[date_col] == dt]
@@ -237,20 +310,23 @@ def excel_lookup(lookup_date):
         val = row[lastyear_col].values[0]
         ly = float(val) if pd.notna(val) else 0.0
 
+        if forecast_col:
+            fval = row[forecast_col].values[0]
+            fc = float(fval) if pd.notna(fval) and float(fval) > 0 else 0.0
+
         if target_col:
             tval = row[target_col].values[0]
             if pd.notna(tval) and float(tval) > 0:
                 tgt = float(tval)
             else:
-                # Fall back to last known target
                 past = excel_df[(excel_df[date_col] <= dt) & excel_df[target_col].notna() & (excel_df[target_col] > 0)]
                 if not past.empty:
                     tgt = float(past.iloc[-1][target_col])
-    return ly, tgt
+    return ly, fc, tgt
 
 
 def fetch_shopify_orders_for_date(target_date):
-    """Fetch all Shopify orders for a single MYT day. Returns (net, gross, refunds, order_count)."""
+    """Fetch all Shopify orders for a single MYT day."""
     day_start_my  = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=MY_TZ)
     day_end_my    = day_start_my + timedelta(days=1)
     day_start_utc = day_start_my.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -270,7 +346,6 @@ def fetch_shopify_orders_for_date(target_date):
     while url:
         resp = requests.get(url, params=p, headers=headers)
         if resp.status_code == 429:
-            # Rate limited — wait and retry
             retry_after = float(resp.headers.get("Retry-After", 2))
             print(f"      ⏳ Rate limited, waiting {retry_after}s...")
             time.sleep(retry_after)
@@ -289,14 +364,11 @@ def fetch_shopify_orders_for_date(target_date):
                     url = part.split(";")[0].strip().strip("<>")
                     break
 
-    # Calculate — same logic as today's sync
-    # Gross = (subtotal + discounts) of ALL orders (including cancelled)
     gross = sum(
         float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0))
         for o in orders
     )
 
-    # Current = active orders minus refunds
     active = [o for o in orders if o.get("cancel_reason") is None]
     current_total = 0.0
     refunds_total = 0.0
@@ -322,7 +394,7 @@ skipped = 0
 while current <= HISTORY_END:
     ds = current.strftime("%Y-%m-%d")
 
-    # Skip future dates (can't fetch orders that haven't happened yet)
+    # Skip future dates
     if current > today_date:
         print(f"   ⏭  {ds} — future date, stopping backfill")
         break
@@ -333,10 +405,10 @@ while current <= HISTORY_END:
         current += timedelta(days=1)
         continue
 
-    # Check if this date already exists in Firestore
+    # Check if this date already has Shopify data in Firestore
     doc_ref = db.collection("sales").document("daily").collection("days").document(ds)
     doc = doc_ref.get()
-    if doc.exists:
+    if doc.exists and doc.to_dict().get("source") == "shopify":
         skipped += 1
         current += timedelta(days=1)
         continue
@@ -353,27 +425,26 @@ while current <= HISTORY_END:
     net, gross, refunds, order_count = result
 
     # Excel lookup
-    ly, tgt = excel_lookup(current)
+    ly, fc, tgt = excel_lookup(current)
 
     # Write to Firestore
     doc_ref.set({
-        "date":         ds,
-        "currentSale":  float(f"{net:.2f}"),
-        "grossSale":    float(f"{gross:.2f}"),
-        "totalRefunds": float(f"{refunds:.2f}"),
-        "totalOrders":  order_count,
-        "lastYearSale": float(f"{ly:.2f}"),
-        "dailyTarget":  float(f"{tgt:.2f}"),
-        "syncedAt":     now_my.isoformat(),
-        "source":       "shopify",
+        "date":          ds,
+        "currentSale":   float(f"{net:.2f}"),
+        "grossSale":     float(f"{gross:.2f}"),
+        "totalRefunds":  float(f"{refunds:.2f}"),
+        "totalOrders":   order_count,
+        "lastYearSale":  float(f"{ly:.2f}"),
+        "dailyForecast": float(f"{fc:.2f}"),
+        "dailyTarget":   float(f"{tgt:.2f}"),
+        "syncedAt":      now_my.isoformat(),
+        "source":        "shopify",
     })
 
-    print(f"✅ Gross RM{gross:.2f} | Current RM{net:.2f} | Orders {order_count} | LY RM{ly:.2f} | Tgt RM{tgt:.2f}")
+    print(f"✅ Gross RM{gross:.2f} | Current RM{net:.2f} | Orders {order_count} | LY RM{ly:.2f} | Forecast RM{fc:.2f} | Tgt RM{tgt:.2f}")
     synced += 1
 
-    # Small delay to respect Shopify API rate limits (2 calls/sec)
     time.sleep(0.5)
-
     current += timedelta(days=1)
 
 print(f"\n{'═'*65}")
