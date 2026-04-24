@@ -287,7 +287,7 @@ else:
 # Skips future dates. Uses same net-sale logic as today's sync.
 # ══════════════════════════════════════════════════════════════
 
-HISTORY_START = date(2026, 3, 26)   # Day 62
+HISTORY_START = date(2026, 3, 27)   # Day 61
 HISTORY_END   = date(2026, 5, 27)
 
 print(f"\n{'═'*65}")
