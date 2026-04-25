@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import sys
 import requests
 import pandas as pd
 from datetime import datetime, timezone, timedelta, date
@@ -11,6 +12,11 @@ from firebase_admin import credentials, firestore
 SHOPIFY_STORE = os.environ["SHOPIFY_STORE"]
 SHOPIFY_TOKEN = os.environ["SHOPIFY_TOKEN"]
 FIREBASE_CREDS = json.loads(os.environ["FIREBASE_CREDENTIALS"])
+
+# ── Check run mode ───────────────────────────────────────────
+# FULL_SYNC=1 → Excel sync + historical backfill (push/manual only)
+# Default (cron) → today's Shopify only = 1 batch write (2 docs)
+FULL_SYNC = os.environ.get("FULL_SYNC", "0") == "1"
 
 # ── Init Firebase ────────────────────────────────────────────
 cred = credentials.Certificate(FIREBASE_CREDS)
@@ -34,8 +40,9 @@ start_str = start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 end_str   = end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 print(f"📅 {today_str} | Window: 12:00 AM → {now_my.strftime('%I:%M:%S %p')} MYT")
+print(f"🔧 Mode: {'FULL SYNC (Excel + Backfill)' if FULL_SYNC else 'QUICK SYNC (today only)'}")
 
-# ── STEP 1: Read Excel for lastYearSale, dailyForecast & dailyTarget ──
+# ── STEP 1: Read Excel for today's row ───────────────────────
 last_year_sale  = 0.0
 daily_target    = 0.0
 daily_forecast  = 0.0
@@ -184,23 +191,8 @@ print(f"   Target      : RM{daily_target:.2f}")
 updated_at = now_my.strftime("%H:%M:%S")
 
 # ── STEP 4: Push today to Firestore ──────────────────────────
-doc_ref = db.collection("sales").document("today")
-doc_ref.set({
-    "currentSale":   float(f"{current_sale:.2f}"),
-    "grossSale":     float(f"{gross_sale:.2f}"),
-    "totalRefunds":  float(f"{total_returns:.2f}"),
-    "totalOrders":   total_orders,
-    "lastYearSale":  float(f"{last_year_sale:.2f}"),
-    "dailyForecast": float(f"{daily_forecast:.2f}"),
-    "dailyTarget":   float(f"{daily_target:.2f}"),
-    "updatedAt":     updated_at,
-    "syncedAt":      now_my.isoformat(),
-    "source":        "shopify",
-}, merge=False)
-
-today_daily_ref = db.collection("sales").document("daily").collection("days").document(today_str)
-today_daily_ref.set({
-    "date":          today_str,
+# Batch write = 1 commit for 2 documents
+today_data = {
     "currentSale":   float(f"{current_sale:.2f}"),
     "grossSale":     float(f"{gross_sale:.2f}"),
     "totalRefunds":  float(f"{total_returns:.2f}"),
@@ -210,83 +202,119 @@ today_daily_ref.set({
     "dailyTarget":   float(f"{daily_target:.2f}"),
     "syncedAt":      now_my.isoformat(),
     "source":        "shopify",
-}, merge=False)
+}
 
-print(f"\n✅ Firestore synced (today)!")
+wb = db.batch()
+wb.set(db.collection("sales").document("today"),
+       {**today_data, "updatedAt": updated_at}, merge=False)
+wb.set(db.collection("sales").document("daily").collection("days").document(today_str),
+       {**today_data, "date": today_str}, merge=False)
+wb.commit()
+
+print(f"\n✅ Firestore synced (today) — 1 batch commit (2 docs)")
 print(f"🔥 Gross RM{gross_sale:.2f} | Current RM{current_sale:.2f} | LY RM{last_year_sale:.2f} | Forecast RM{daily_forecast:.2f} | Target RM{daily_target:.2f} | Orders {total_orders}")
 
-
 # ══════════════════════════════════════════════════════════════
+# BELOW ONLY RUNS ON FULL_SYNC (push to main / manual trigger)
+# Cron runs stop here = 1 batch write per run
+# ══════════════════════════════════════════════════════════════
+
+if not FULL_SYNC:
+    print(f"\n⏩ Quick sync done — skipping Excel sync & backfill")
+    print(f"   💡 To run full sync: push to main or dispatch manually")
+    sys.exit(0)
+
+
 # ── STEP 5: Sync ALL Excel rows to Firestore ─────────────────
-# Pushes lastYearSale, dailyForecast, dailyTarget for EVERY row
-# in the Excel file (past AND future dates).
-# For past dates that already have Shopify data, merges the
-# Excel fields — does NOT overwrite currentSale/orders.
-# For future dates (no Shopify data), creates the doc with
-# Excel data so the chart can show forecast/lastYear ahead.
-# ══════════════════════════════════════════════════════════════
-
+# Fetches all existing docs in ONE read, compares values,
+# only writes rows that actually changed. Uses batch writes.
 print(f"\n{'═'*65}")
-print(f"📊 EXCEL SYNC: Pushing all Excel rows to Firestore")
+print(f"📊 EXCEL SYNC: Checking Excel rows against Firestore")
 print(f"{'═'*65}")
 
 excel_synced = 0
+excel_skipped = 0
+
+# Cache all existing daily docs in one read
+days_ref = db.collection("sales").document("daily").collection("days")
+existing_docs = {}
+for doc in days_ref.stream():
+    existing_docs[doc.id] = doc.to_dict()
+print(f"   📖 Loaded {len(existing_docs)} existing docs (1 collection read)")
 
 if excel_df is not None and date_col is not None and lastyear_col is not None:
+    wb = db.batch()
+    batch_count = 0
+
     for _, erow in excel_df.iterrows():
         row_date = erow[date_col]
         if pd.isna(row_date):
             continue
 
         ds = row_date.strftime("%Y-%m-%d")
-
-        # Skip today — already synced in Step 4
         if ds == today_str:
             continue
 
-        # Build Excel fields
+        # Build new values
         ly  = float(erow[lastyear_col]) if lastyear_col and pd.notna(erow[lastyear_col]) else 0.0
         fc  = float(erow[forecast_col]) if forecast_col and pd.notna(erow[forecast_col]) else 0.0
         tgt = float(erow[target_col])   if target_col   and pd.notna(erow[target_col])   else 0.0
 
-        excel_patch = {
-            "date":          ds,
-            "lastYearSale":  float(f"{ly:.2f}"),
-            "dailyForecast": float(f"{fc:.2f}"),
-            "dailyTarget":   float(f"{tgt:.2f}"),
-        }
+        new_ly  = float(f"{ly:.2f}")
+        new_fc  = float(f"{fc:.2f}")
+        new_tgt = float(f"{tgt:.2f}")
 
-        doc_ref = db.collection("sales").document("daily").collection("days").document(ds)
-        doc = doc_ref.get()
-
-        if doc.exists:
-            # Document exists (has Shopify data) — merge Excel fields only
-            doc_ref.set(excel_patch, merge=True)
+        # Compare with existing — skip if unchanged
+        existing = existing_docs.get(ds)
+        if existing:
+            if (existing.get("lastYearSale") == new_ly and
+                existing.get("dailyForecast") == new_fc and
+                existing.get("dailyTarget") == new_tgt):
+                excel_skipped += 1
+                continue
+            # Only merge the changed fields
+            wb.set(days_ref.document(ds), {
+                "date":          ds,
+                "lastYearSale":  new_ly,
+                "dailyForecast": new_fc,
+                "dailyTarget":   new_tgt,
+            }, merge=True)
         else:
-            # No Shopify data yet — create doc with Excel data + zeroed Shopify fields
-            excel_patch.update({
-                "currentSale":  0.0,
-                "grossSale":    0.0,
-                "totalRefunds": 0.0,
-                "totalOrders":  0,
-                "syncedAt":     now_my.isoformat(),
-                "source":       "excel",
+            # New doc — create with zeroed Shopify fields
+            wb.set(days_ref.document(ds), {
+                "date":          ds,
+                "lastYearSale":  new_ly,
+                "dailyForecast": new_fc,
+                "dailyTarget":   new_tgt,
+                "currentSale":   0.0,
+                "grossSale":     0.0,
+                "totalRefunds":  0.0,
+                "totalOrders":   0,
+                "syncedAt":      now_my.isoformat(),
+                "source":        "excel",
             })
-            doc_ref.set(excel_patch)
 
         excel_synced += 1
+        batch_count += 1
 
-    print(f"   ✅ {excel_synced} Excel rows synced to Firestore")
+        # Firestore batch limit is 500
+        if batch_count >= 490:
+            wb.commit()
+            print(f"   📤 Committed batch of {batch_count} writes")
+            wb = db.batch()
+            batch_count = 0
+
+    if batch_count > 0:
+        wb.commit()
+        print(f"   📤 Committed batch of {batch_count} writes")
+
+    print(f"   ✅ {excel_synced} rows written, {excel_skipped} unchanged (skipped)")
 else:
     print(f"   ⚠️  No Excel data available — skipping")
 
 
-# ══════════════════════════════════════════════════════════════
-# ── STEP 6: Historical Shopify backfill (26/3/2026 → 27/5/2026)
-# Only fetches days missing Shopify data from Firestore.
-# Skips future dates. Uses same net-sale logic as today's sync.
-# ══════════════════════════════════════════════════════════════
-
+# ── STEP 6: Historical Shopify backfill ──────────────────────
+# Uses existing_docs cache — zero extra reads
 HISTORY_START = date(2026, 3, 27)   # Day 61
 HISTORY_END   = date(2026, 5, 27)
 
@@ -385,49 +413,42 @@ def fetch_shopify_orders_for_date(target_date):
     return current_total, gross, refunds_total, len(active)
 
 
-# ── Loop through each date in range ──────────────────────────
+# ── Loop — uses existing_docs cache, zero extra reads ────────
 today_date = now_my.date()
-current = HISTORY_START
+current_date = HISTORY_START
 synced  = 0
 skipped = 0
 
-while current <= HISTORY_END:
-    ds = current.strftime("%Y-%m-%d")
+while current_date <= HISTORY_END:
+    ds = current_date.strftime("%Y-%m-%d")
 
-    # Skip future dates
-    if current > today_date:
+    if current_date > today_date:
         print(f"   ⏭  {ds} — future date, stopping backfill")
         break
 
-    # Skip today — already synced in Step 4
-    if current == today_date:
-        print(f"   ⏭  {ds} — today (already synced above)")
-        current += timedelta(days=1)
+    if current_date == today_date:
+        current_date += timedelta(days=1)
         continue
 
-    # Check if this date already has Shopify data in Firestore
-    doc_ref = db.collection("sales").document("daily").collection("days").document(ds)
-    doc = doc_ref.get()
-    if doc.exists and doc.to_dict().get("source") == "shopify":
+    # Use cache — no Firestore read
+    existing = existing_docs.get(ds)
+    if existing and existing.get("source") == "shopify":
         skipped += 1
-        current += timedelta(days=1)
+        current_date += timedelta(days=1)
         continue
 
-    # Fetch from Shopify
     print(f"   📦 {ds} — fetching from Shopify...", end=" ")
-    result = fetch_shopify_orders_for_date(current)
+    result = fetch_shopify_orders_for_date(current_date)
 
     if result is None:
         print("FAILED — skipping")
-        current += timedelta(days=1)
+        current_date += timedelta(days=1)
         continue
 
     net, gross, refunds, order_count = result
+    ly, fc, tgt = excel_lookup(current_date)
 
-    # Excel lookup
-    ly, fc, tgt = excel_lookup(current)
-
-    # Write to Firestore
+    doc_ref = db.collection("sales").document("daily").collection("days").document(ds)
     doc_ref.set({
         "date":          ds,
         "currentSale":   float(f"{net:.2f}"),
@@ -445,7 +466,7 @@ while current <= HISTORY_END:
     synced += 1
 
     time.sleep(0.5)
-    current += timedelta(days=1)
+    current_date += timedelta(days=1)
 
 print(f"\n{'═'*65}")
 print(f"📜 Backfill complete: {synced} days synced, {skipped} days already existed")
