@@ -214,9 +214,184 @@ wb.commit()
 print(f"\n✅ Firestore synced (today) — 1 batch commit (2 docs)")
 print(f"🔥 Gross RM{gross_sale:.2f} | Current RM{current_sale:.2f} | LY RM{last_year_sale:.2f} | Forecast RM{daily_forecast:.2f} | Target RM{daily_target:.2f} | Orders {total_orders}")
 
+
+# ── Helper functions (used by sync request + backfill) ────────
+
+def excel_lookup(lookup_date):
+    """Return (lastYearSale, dailyForecast, dailyTarget) from the Excel DataFrame."""
+    ly  = 0.0
+    fc  = 0.0
+    tgt = 0.0
+    if excel_df is None or date_col is None or lastyear_col is None:
+        return ly, fc, tgt
+
+    dt = pd.Timestamp(lookup_date.year, lookup_date.month, lookup_date.day)
+    row = excel_df[excel_df[date_col] == dt]
+
+    if not row.empty:
+        val = row[lastyear_col].values[0]
+        ly = float(val) if pd.notna(val) else 0.0
+
+        if forecast_col:
+            fval = row[forecast_col].values[0]
+            fc = float(fval) if pd.notna(fval) and float(fval) > 0 else 0.0
+
+        if target_col:
+            tval = row[target_col].values[0]
+            if pd.notna(tval) and float(tval) > 0:
+                tgt = float(tval)
+            else:
+                past = excel_df[(excel_df[date_col] <= dt) & excel_df[target_col].notna() & (excel_df[target_col] > 0)]
+                if not past.empty:
+                    tgt = float(past.iloc[-1][target_col])
+    return ly, fc, tgt
+
+
+def fetch_shopify_orders_for_date(target_date):
+    """Fetch all Shopify orders for a single MYT day."""
+    day_start_my  = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=MY_TZ)
+    day_end_my    = day_start_my + timedelta(days=1)
+    day_start_utc = day_start_my.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    day_end_utc   = day_end_my.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    orders = []
+    url    = f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json"
+    p      = {
+        "created_at_min": day_start_utc,
+        "created_at_max": day_end_utc,
+        "status":           "any",
+        "financial_status": "any",
+        "limit":            250,
+        "fields":           "id,order_number,subtotal_price,total_discounts,financial_status,cancel_reason,refunds",
+    }
+
+    while url:
+        resp = requests.get(url, params=p, headers=headers)
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", 2))
+            print(f"      ⏳ Rate limited, waiting {retry_after}s...")
+            time.sleep(retry_after)
+            continue
+        if resp.status_code != 200:
+            print(f"      ❌ Shopify API error {resp.status_code}: {resp.text}")
+            return None
+        batch = resp.json().get("orders", [])
+        orders.extend(batch)
+        link = resp.headers.get("Link", "")
+        url  = None
+        p    = {}
+        if 'rel="next"' in link:
+            for part in link.split(","):
+                if 'rel="next"' in part:
+                    url = part.split(";")[0].strip().strip("<>")
+                    break
+
+    gross = sum(
+        float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0))
+        for o in orders
+    )
+
+    active = [o for o in orders if o.get("cancel_reason") is None]
+    current_total = 0.0
+    refunds_total = 0.0
+    for o in active:
+        subtotal = float(o.get("subtotal_price", 0))
+        order_refunds = sum(
+            float(rli.get("subtotal", 0))
+            for refund in o.get("refunds", [])
+            for rli in refund.get("refund_line_items", [])
+        )
+        current_total += subtotal - order_refunds
+        refunds_total += order_refunds
+
+    return current_total, gross, refunds_total, len(active)
+
+
+# ══════════════════════════════════════════════════════════════
+# ── STEP 4.5: Check for manual sync requests ─────────────────
+# Runs on EVERY cron. Checks sales/syncRequest for pending jobs.
+# ══════════════════════════════════════════════════════════════
+
+try:
+    sync_req_ref = db.collection("sales").document("syncRequest")
+    sync_req = sync_req_ref.get()
+
+    if sync_req.exists:
+        req_data = sync_req.to_dict()
+        if req_data.get("status") == "pending":
+            from_date = date.fromisoformat(req_data["fromDate"])
+            to_date = date.fromisoformat(req_data["toDate"])
+
+            print(f"\n{'═'*65}")
+            print(f"🔄 MANUAL SYNC REQUEST: {from_date} → {to_date}")
+            print(f"{'═'*65}")
+
+            # Mark as processing
+            sync_req_ref.set({"status": "processing", "startedAt": now_my.isoformat()}, merge=True)
+
+            req_synced = 0
+            d = from_date
+            while d <= to_date:
+                ds = d.strftime("%Y-%m-%d")
+
+                # Skip future dates
+                if d > now_my.date():
+                    print(f"   ⏭  {ds} — future date, skipping")
+                    d += timedelta(days=1)
+                    continue
+
+                # Skip today — already synced in Step 4
+                if d == now_my.date():
+                    print(f"   ⏭  {ds} — today (already synced)")
+                    d += timedelta(days=1)
+                    continue
+
+                print(f"   📦 {ds} — fetching from Shopify...", end=" ")
+                result = fetch_shopify_orders_for_date(d)
+
+                if result is None:
+                    print("FAILED")
+                    d += timedelta(days=1)
+                    continue
+
+                net, gross_d, refunds_d, order_count = result
+                ly, fc, tgt = excel_lookup(d)
+
+                doc_ref = db.collection("sales").document("daily").collection("days").document(ds)
+                doc_ref.set({
+                    "date":          ds,
+                    "currentSale":   float(f"{net:.2f}"),
+                    "grossSale":     float(f"{gross_d:.2f}"),
+                    "totalRefunds":  float(f"{refunds_d:.2f}"),
+                    "totalOrders":   order_count,
+                    "lastYearSale":  float(f"{ly:.2f}"),
+                    "dailyForecast": float(f"{fc:.2f}"),
+                    "dailyTarget":   float(f"{tgt:.2f}"),
+                    "syncedAt":      now_my.isoformat(),
+                    "source":        "shopify",
+                })
+
+                print(f"✅ Current RM{net:.2f} | Orders {order_count}")
+                req_synced += 1
+                time.sleep(0.5)
+                d += timedelta(days=1)
+
+            # Mark as completed
+            sync_req_ref.set({
+                "status": "completed",
+                "completedAt": now_my.isoformat(),
+                "daysSynced": req_synced,
+            }, merge=True)
+
+            print(f"   ✅ Manual sync complete: {req_synced} days synced")
+
+except Exception as e:
+    print(f"\n⚠️  Sync request check failed: {e}")
+
+
 # ══════════════════════════════════════════════════════════════
 # BELOW ONLY RUNS ON FULL_SYNC (push to main / manual trigger)
-# Cron runs stop here = 1 batch write per run
+# Cron runs stop here (after processing any sync requests)
 # ══════════════════════════════════════════════════════════════
 
 if not FULL_SYNC:
@@ -321,96 +496,6 @@ HISTORY_END   = date(2026, 5, 27)
 print(f"\n{'═'*65}")
 print(f"📜 HISTORICAL BACKFILL: {HISTORY_START} → {HISTORY_END}")
 print(f"{'═'*65}")
-
-
-def excel_lookup(lookup_date):
-    """Return (lastYearSale, dailyForecast, dailyTarget) from the Excel DataFrame."""
-    ly  = 0.0
-    fc  = 0.0
-    tgt = 0.0
-    if excel_df is None or date_col is None or lastyear_col is None:
-        return ly, fc, tgt
-
-    dt = pd.Timestamp(lookup_date.year, lookup_date.month, lookup_date.day)
-    row = excel_df[excel_df[date_col] == dt]
-
-    if not row.empty:
-        val = row[lastyear_col].values[0]
-        ly = float(val) if pd.notna(val) else 0.0
-
-        if forecast_col:
-            fval = row[forecast_col].values[0]
-            fc = float(fval) if pd.notna(fval) and float(fval) > 0 else 0.0
-
-        if target_col:
-            tval = row[target_col].values[0]
-            if pd.notna(tval) and float(tval) > 0:
-                tgt = float(tval)
-            else:
-                past = excel_df[(excel_df[date_col] <= dt) & excel_df[target_col].notna() & (excel_df[target_col] > 0)]
-                if not past.empty:
-                    tgt = float(past.iloc[-1][target_col])
-    return ly, fc, tgt
-
-
-def fetch_shopify_orders_for_date(target_date):
-    """Fetch all Shopify orders for a single MYT day."""
-    day_start_my  = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=MY_TZ)
-    day_end_my    = day_start_my + timedelta(days=1)
-    day_start_utc = day_start_my.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    day_end_utc   = day_end_my.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    orders = []
-    url    = f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json"
-    p      = {
-        "created_at_min": day_start_utc,
-        "created_at_max": day_end_utc,
-        "status":           "any",
-        "financial_status": "any",
-        "limit":            250,
-        "fields":           "id,order_number,subtotal_price,total_discounts,financial_status,cancel_reason,refunds",
-    }
-
-    while url:
-        resp = requests.get(url, params=p, headers=headers)
-        if resp.status_code == 429:
-            retry_after = float(resp.headers.get("Retry-After", 2))
-            print(f"      ⏳ Rate limited, waiting {retry_after}s...")
-            time.sleep(retry_after)
-            continue
-        if resp.status_code != 200:
-            print(f"      ❌ Shopify API error {resp.status_code}: {resp.text}")
-            return None
-        batch = resp.json().get("orders", [])
-        orders.extend(batch)
-        link = resp.headers.get("Link", "")
-        url  = None
-        p    = {}
-        if 'rel="next"' in link:
-            for part in link.split(","):
-                if 'rel="next"' in part:
-                    url = part.split(";")[0].strip().strip("<>")
-                    break
-
-    gross = sum(
-        float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0))
-        for o in orders
-    )
-
-    active = [o for o in orders if o.get("cancel_reason") is None]
-    current_total = 0.0
-    refunds_total = 0.0
-    for o in active:
-        subtotal = float(o.get("subtotal_price", 0))
-        order_refunds = sum(
-            float(rli.get("subtotal", 0))
-            for refund in o.get("refunds", [])
-            for rli in refund.get("refund_line_items", [])
-        )
-        current_total += subtotal - order_refunds
-        refunds_total += order_refunds
-
-    return current_total, gross, refunds_total, len(active)
 
 
 # ── Loop — uses existing_docs cache, zero extra reads ────────
