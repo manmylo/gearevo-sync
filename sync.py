@@ -14,8 +14,8 @@ SHOPIFY_TOKEN = os.environ["SHOPIFY_TOKEN"]
 FIREBASE_CREDS = json.loads(os.environ["FIREBASE_CREDENTIALS"])
 
 # ── Check run mode ───────────────────────────────────────────
-# FULL_SYNC=1 → Excel sync + historical backfill (push/manual only)
-# Default (cron) → today's Shopify only = 1 batch write (2 docs)
+# FULL_SYNC=1 → historical Shopify backfill (push/manual only)
+# Default (cron) → today's Shopify + Excel sync for all rows
 FULL_SYNC = os.environ.get("FULL_SYNC", "0") == "1"
 
 # ── Init Firebase ────────────────────────────────────────────
@@ -40,7 +40,7 @@ start_str = start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 end_str   = end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 print(f"📅 {today_str} | Window: 12:00 AM → {now_my.strftime('%I:%M:%S %p')} MYT")
-print(f"🔧 Mode: {'FULL SYNC (Excel + Backfill)' if FULL_SYNC else 'QUICK SYNC (today only)'}")
+print(f"🔧 Mode: {'FULL SYNC (+ Shopify Backfill)' if FULL_SYNC else 'QUICK SYNC (today + Excel)'}")
 
 # ── STEP 1: Read Excel for today's row ───────────────────────
 last_year_sale  = 0.0
@@ -390,19 +390,11 @@ except Exception as e:
 
 
 # ══════════════════════════════════════════════════════════════
-# BELOW ONLY RUNS ON FULL_SYNC (push to main / manual trigger)
-# Cron runs stop here (after processing any sync requests)
+# ── STEP 5: Sync ALL Excel rows to Firestore (every run) ─────
+# Reads all existing docs in ONE read, compares values,
+# only writes rows where Excel has data AND it differs.
+# Empty Excel cells are never written (preserves Firestore data).
 # ══════════════════════════════════════════════════════════════
-
-if not FULL_SYNC:
-    print(f"\n⏩ Quick sync done — skipping Excel sync & backfill")
-    print(f"   💡 To run full sync: push to main or dispatch manually")
-    sys.exit(0)
-
-
-# ── STEP 5: Sync ALL Excel rows to Firestore ─────────────────
-# Fetches all existing docs in ONE read, compares values,
-# only writes rows that actually changed. Uses batch writes.
 print(f"\n{'═'*65}")
 print(f"📊 EXCEL SYNC: Checking Excel rows against Firestore")
 print(f"{'═'*65}")
@@ -417,7 +409,7 @@ for doc in days_ref.stream():
     existing_docs[doc.id] = doc.to_dict()
 print(f"   📖 Loaded {len(existing_docs)} existing docs (1 collection read)")
 
-if excel_df is not None and date_col is not None and lastyear_col is not None:
+if excel_df is not None and date_col is not None:
     wb = db.batch()
     batch_count = 0
 
@@ -430,44 +422,47 @@ if excel_df is not None and date_col is not None and lastyear_col is not None:
         if ds == today_str:
             continue
 
-        # Build new values
-        ly  = float(erow[lastyear_col]) if lastyear_col and pd.notna(erow[lastyear_col]) else 0.0
-        fc  = float(erow[forecast_col]) if forecast_col and pd.notna(erow[forecast_col]) else 0.0
-        tgt = float(erow[target_col])   if target_col   and pd.notna(erow[target_col])   else 0.0
+        # Build update dict — ONLY include non-empty Excel cells
+        update = {"date": ds}
+        if lastyear_col and pd.notna(erow[lastyear_col]):
+            update["lastYearSale"] = float(f"{float(erow[lastyear_col]):.2f}")
+        if forecast_col and pd.notna(erow[forecast_col]):
+            update["dailyForecast"] = float(f"{float(erow[forecast_col]):.2f}")
+        if target_col and pd.notna(erow[target_col]):
+            update["dailyTarget"] = float(f"{float(erow[target_col]):.2f}")
 
-        new_ly  = float(f"{ly:.2f}")
-        new_fc  = float(f"{fc:.2f}")
-        new_tgt = float(f"{tgt:.2f}")
+        # Nothing to write (all Excel cells empty for this row)
+        if len(update) <= 1:  # only "date" key
+            excel_skipped += 1
+            continue
 
-        # Compare with existing — skip if unchanged
+        # Compare with existing — skip if all values are the same
         existing = existing_docs.get(ds)
         if existing:
-            if (existing.get("lastYearSale") == new_ly and
-                existing.get("dailyForecast") == new_fc and
-                existing.get("dailyTarget") == new_tgt):
+            all_same = True
+            for key, val in update.items():
+                if key == "date":
+                    continue
+                if existing.get(key) != val:
+                    all_same = False
+                    break
+            if all_same:
                 excel_skipped += 1
                 continue
-            # Only merge the changed fields
-            wb.set(days_ref.document(ds), {
-                "date":          ds,
-                "lastYearSale":  new_ly,
-                "dailyForecast": new_fc,
-                "dailyTarget":   new_tgt,
-            }, merge=True)
+            # Merge only the changed fields (preserves Shopify data)
+            wb.set(days_ref.document(ds), update, merge=True)
         else:
-            # New doc — create with zeroed Shopify fields
-            wb.set(days_ref.document(ds), {
-                "date":          ds,
-                "lastYearSale":  new_ly,
-                "dailyForecast": new_fc,
-                "dailyTarget":   new_tgt,
+            # New doc — create with Excel data + zeroed Shopify fields
+            new_doc = {
                 "currentSale":   0.0,
                 "grossSale":     0.0,
                 "totalRefunds":  0.0,
                 "totalOrders":   0,
                 "syncedAt":      now_my.isoformat(),
                 "source":        "excel",
-            })
+            }
+            new_doc.update(update)
+            wb.set(days_ref.document(ds), new_doc)
 
         excel_synced += 1
         batch_count += 1
@@ -483,9 +478,20 @@ if excel_df is not None and date_col is not None and lastyear_col is not None:
         wb.commit()
         print(f"   📤 Committed batch of {batch_count} writes")
 
-    print(f"   ✅ {excel_synced} rows written, {excel_skipped} unchanged (skipped)")
+    print(f"   ✅ {excel_synced} rows written, {excel_skipped} unchanged/empty (skipped)")
 else:
     print(f"   ⚠️  No Excel data available — skipping")
+
+
+# ══════════════════════════════════════════════════════════════
+# BELOW ONLY RUNS ON FULL_SYNC (push to main / manual trigger)
+# Cron runs stop here.
+# ══════════════════════════════════════════════════════════════
+
+if not FULL_SYNC:
+    print(f"\n⏩ Quick sync done — skipping historical Shopify backfill")
+    print(f"   💡 To run full sync: push to main or dispatch manually")
+    sys.exit(0)
 
 
 # ── STEP 6: Historical Shopify backfill ──────────────────────
