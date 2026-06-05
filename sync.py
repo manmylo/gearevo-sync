@@ -390,97 +390,124 @@ except Exception as e:
 
 
 # ══════════════════════════════════════════════════════════════
-# ── STEP 5: Sync ALL Excel rows to Firestore (every run) ─────
-# Reads all existing docs in ONE read, compares values,
-# only writes rows where Excel has data AND it differs.
+# ── STEP 5: Sync Excel rows to Firestore (hash-gated) ────────
+# Computes a hash of the Excel file. If unchanged since last
+# sync, skips entirely (1 read only). If changed, reads all
+# existing docs, compares, and writes only changed rows.
 # Empty Excel cells are never written (preserves Firestore data).
 # ══════════════════════════════════════════════════════════════
-print(f"\n{'═'*65}")
-print(f"📊 EXCEL SYNC: Checking Excel rows against Firestore")
-print(f"{'═'*65}")
+import hashlib
 
 excel_synced = 0
 excel_skipped = 0
+existing_docs = {}   # shared with FULL_SYNC backfill below
 
-# Cache all existing daily docs in one read
-days_ref = db.collection("sales").document("daily").collection("days")
-existing_docs = {}
-for doc in days_ref.stream():
-    existing_docs[doc.id] = doc.to_dict()
-print(f"   📖 Loaded {len(existing_docs)} existing docs (1 collection read)")
+try:
+    # Compute hash of Excel file
+    excel_hash = ""
+    try:
+        with open("Sales_and_Target.xlsx", "rb") as f:
+            excel_hash = hashlib.md5(f.read()).hexdigest()
+    except FileNotFoundError:
+        excel_hash = ""
 
-if excel_df is not None and date_col is not None:
-    wb = db.batch()
-    batch_count = 0
+    if excel_hash and excel_df is not None and date_col is not None:
+        # Read stored hash (1 read)
+        hash_ref = db.collection("sales").document("excelSyncHash")
+        hash_doc = hash_ref.get()
+        stored_hash = hash_doc.to_dict().get("hash", "") if hash_doc.exists else ""
 
-    for _, erow in excel_df.iterrows():
-        row_date = erow[date_col]
-        if pd.isna(row_date):
-            continue
-
-        ds = row_date.strftime("%Y-%m-%d")
-        if ds == today_str:
-            continue
-
-        # Build update dict — ONLY include non-empty Excel cells
-        update = {"date": ds}
-        if lastyear_col and pd.notna(erow[lastyear_col]):
-            update["lastYearSale"] = float(f"{float(erow[lastyear_col]):.2f}")
-        if forecast_col and pd.notna(erow[forecast_col]):
-            update["dailyForecast"] = float(f"{float(erow[forecast_col]):.2f}")
-        if target_col and pd.notna(erow[target_col]):
-            update["dailyTarget"] = float(f"{float(erow[target_col]):.2f}")
-
-        # Nothing to write (all Excel cells empty for this row)
-        if len(update) <= 1:  # only "date" key
-            excel_skipped += 1
-            continue
-
-        # Compare with existing — skip if all values are the same
-        existing = existing_docs.get(ds)
-        if existing:
-            all_same = True
-            for key, val in update.items():
-                if key == "date":
-                    continue
-                if existing.get(key) != val:
-                    all_same = False
-                    break
-            if all_same:
-                excel_skipped += 1
-                continue
-            # Merge only the changed fields (preserves Shopify data)
-            wb.set(days_ref.document(ds), update, merge=True)
+        if excel_hash == stored_hash:
+            print(f"\n📊 EXCEL SYNC: File unchanged (hash match) — skipped (0 reads)")
         else:
-            # New doc — create with Excel data + zeroed Shopify fields
-            new_doc = {
-                "currentSale":   0.0,
-                "grossSale":     0.0,
-                "totalRefunds":  0.0,
-                "totalOrders":   0,
-                "syncedAt":      now_my.isoformat(),
-                "source":        "excel",
-            }
-            new_doc.update(update)
-            wb.set(days_ref.document(ds), new_doc)
+            print(f"\n{'═'*65}")
+            print(f"📊 EXCEL SYNC: File changed — syncing to Firestore")
+            print(f"{'═'*65}")
 
-        excel_synced += 1
-        batch_count += 1
+            # Cache all existing daily docs in one read
+            days_ref = db.collection("sales").document("daily").collection("days")
+            for doc in days_ref.stream():
+                existing_docs[doc.id] = doc.to_dict()
+            print(f"   📖 Loaded {len(existing_docs)} existing docs (1 collection read)")
 
-        # Firestore batch limit is 500
-        if batch_count >= 490:
-            wb.commit()
-            print(f"   📤 Committed batch of {batch_count} writes")
             wb = db.batch()
             batch_count = 0
 
-    if batch_count > 0:
-        wb.commit()
-        print(f"   📤 Committed batch of {batch_count} writes")
+            for _, erow in excel_df.iterrows():
+                row_date = erow[date_col]
+                if pd.isna(row_date):
+                    continue
 
-    print(f"   ✅ {excel_synced} rows written, {excel_skipped} unchanged/empty (skipped)")
-else:
-    print(f"   ⚠️  No Excel data available — skipping")
+                ds = row_date.strftime("%Y-%m-%d")
+                if ds == today_str:
+                    continue
+
+                # Build update dict — ONLY include non-empty Excel cells
+                update = {"date": ds}
+                if lastyear_col and pd.notna(erow[lastyear_col]):
+                    update["lastYearSale"] = float(f"{float(erow[lastyear_col]):.2f}")
+                if forecast_col and pd.notna(erow[forecast_col]):
+                    update["dailyForecast"] = float(f"{float(erow[forecast_col]):.2f}")
+                if target_col and pd.notna(erow[target_col]):
+                    update["dailyTarget"] = float(f"{float(erow[target_col]):.2f}")
+
+                # Nothing to write (all Excel cells empty for this row)
+                if len(update) <= 1:  # only "date" key
+                    excel_skipped += 1
+                    continue
+
+                # Compare with existing — skip if all values are the same
+                existing = existing_docs.get(ds)
+                if existing:
+                    all_same = True
+                    for key, val in update.items():
+                        if key == "date":
+                            continue
+                        if existing.get(key) != val:
+                            all_same = False
+                            break
+                    if all_same:
+                        excel_skipped += 1
+                        continue
+                    # Merge only the changed fields (preserves Shopify data)
+                    wb.set(days_ref.document(ds), update, merge=True)
+                else:
+                    # New doc — create with Excel data + zeroed Shopify fields
+                    new_doc = {
+                        "currentSale":   0.0,
+                        "grossSale":     0.0,
+                        "totalRefunds":  0.0,
+                        "totalOrders":   0,
+                        "syncedAt":      now_my.isoformat(),
+                        "source":        "excel",
+                    }
+                    new_doc.update(update)
+                    wb.set(days_ref.document(ds), new_doc)
+
+                excel_synced += 1
+                batch_count += 1
+
+                # Firestore batch limit is 500
+                if batch_count >= 490:
+                    wb.commit()
+                    print(f"   📤 Committed batch of {batch_count} writes")
+                    wb = db.batch()
+                    batch_count = 0
+
+            # Save new hash in same batch
+            wb.set(hash_ref, {"hash": excel_hash, "syncedAt": now_my.isoformat()})
+            batch_count += 1
+
+            if batch_count > 0:
+                wb.commit()
+                print(f"   📤 Committed batch of {batch_count} writes")
+
+            print(f"   ✅ {excel_synced} rows written, {excel_skipped} unchanged/empty (skipped)")
+    else:
+        print(f"\n📊 EXCEL SYNC: No Excel data available — skipped")
+
+except Exception as e:
+    print(f"\n⚠️  Excel sync failed: {e}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -495,7 +522,12 @@ if not FULL_SYNC:
 
 
 # ── STEP 6: Historical Shopify backfill ──────────────────────
-# Uses existing_docs cache — zero extra reads
+# Uses existing_docs cache — load if not already populated
+if not existing_docs:
+    days_ref = db.collection("sales").document("daily").collection("days")
+    for doc in days_ref.stream():
+        existing_docs[doc.id] = doc.to_dict()
+    print(f"   📖 Loaded {len(existing_docs)} existing docs for backfill")
 HISTORY_START = date(2026, 3, 27)   # Day 61
 HISTORY_END   = date(2026, 5, 27)
 
