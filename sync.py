@@ -136,6 +136,58 @@ total_orders  = len(active_orders)
 
 print(f"   Active orders  : {total_orders} (cancelled excluded: {len(all_orders) - total_orders})")
 
+# ── STEP 2.5: Fetch Ending Inventory Retail Value ────────────
+EXCLUDED_TITLES = [
+    'USED', 'Test', 'Hidden', 'Gearevo Kydex', 'PRE-ORDER',
+    'Gearevo Belt', 'Servis Asah', 'Service Asah', 'Laser Engraving',
+    'T-Shirt', 'Knife Sheath', 'Personalize Stylish', 'Gearevo Cap',
+]
+
+print(f"\n📦 Fetching ending inventory retail value...")
+ending_inventory_retail_value = 0.0
+
+try:
+    inv_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json"
+    inv_params = {
+        "limit": 250,
+        "fields": "id,title,variants",
+        "status": "active",
+    }
+    all_products = []
+    while inv_url:
+        inv_resp = requests.get(inv_url, params=inv_params, headers=headers)
+        if inv_resp.status_code != 200:
+            print(f"   ❌ Shopify API error {inv_resp.status_code}: {inv_resp.text}")
+            break
+        batch = inv_resp.json().get("products", [])
+        all_products.extend(batch)
+        link = inv_resp.headers.get("Link", "")
+        inv_url = None
+        inv_params = {}
+        if 'rel="next"' in link:
+            for part in link.split(","):
+                if 'rel="next"' in part:
+                    inv_url = part.split(";")[0].strip().strip("<>")
+                    break
+
+    print(f"   Total products fetched: {len(all_products)}")
+
+    for product in all_products:
+        title = product.get("title", "")
+        # Skip excluded titles
+        if any(ex.lower() in title.lower() for ex in EXCLUDED_TITLES):
+            continue
+        for variant in product.get("variants", []):
+            qty = int(variant.get("inventory_quantity", 0) or 0)
+            price = float(variant.get("price", 0) or 0)
+            if qty >= 1:
+                ending_inventory_retail_value += qty * price
+
+    print(f"   ✅ Ending Inventory Retail Value: RM{ending_inventory_retail_value:.2f}")
+
+except Exception as e:
+    print(f"   ❌ Inventory fetch error: {e}")
+
 # ── STEP 3: Per-order breakdown + totals ─────────────────────
 print(f"\n{'─'*75}")
 print(f"{'Order':<10} {'Subtotal':>12} {'Returns':>12} {'Net':>12}  Status")
@@ -187,6 +239,7 @@ print(f"   Current     : RM{current_sale:.2f}  ← active orders minus returns")
 print(f"   Last Year   : RM{last_year_sale:.2f}")
 print(f"   Forecast    : RM{daily_forecast:.2f}")
 print(f"   Target      : RM{daily_target:.2f}")
+print(f"   Inventory   : RM{ending_inventory_retail_value:.2f}")
 
 updated_at = now_my.strftime("%H:%M:%S")
 
@@ -200,6 +253,7 @@ today_data = {
     "lastYearSale":  float(f"{last_year_sale:.2f}"),
     "dailyForecast": float(f"{daily_forecast:.2f}"),
     "dailyTarget":   float(f"{daily_target:.2f}"),
+    "endingInventory": float(f"{ending_inventory_retail_value:.2f}"),
     "syncedAt":      now_my.isoformat(),
     "source":        "shopify",
 }
