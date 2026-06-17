@@ -150,7 +150,7 @@ try:
     inv_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json"
     inv_params = {
         "limit": 250,
-        "fields": "id,title,variants",
+        "published_status": "published",
         "status": "active",
     }
     all_products = []
@@ -178,6 +178,9 @@ try:
         if any(ex.lower() in title.lower() for ex in EXCLUDED_TITLES):
             continue
         for variant in product.get("variants", []):
+            # Only count variants where inventory is actually tracked by Shopify
+            if variant.get("inventory_management") != "shopify":
+                continue
             qty = int(variant.get("inventory_quantity", 0) or 0)
             price = float(variant.get("price", 0) or 0)
             if qty >= 1:
