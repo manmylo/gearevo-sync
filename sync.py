@@ -140,7 +140,7 @@ print(f"   Active orders  : {total_orders} (cancelled excluded: {len(all_orders)
 EXCLUDED_TITLES = [
     'USED', 'Test', 'Hidden', 'Gearevo Kydex', 'PRE-ORDER',
     'Gearevo Belt', 'Servis Asah', 'Service Asah', 'Laser Engraving',
-    'T-Shirt', 'Knife Sheath', 'Personalize Stylish', 'Gearevo Cap',
+    'T-Shirt', 'Personalize Stylish', 'Gearevo Cap',
     'Knife Sheath for f. herder', 'Kydex sheath for F. Herder',
 ]
 
