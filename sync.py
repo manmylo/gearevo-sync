@@ -140,9 +140,8 @@ print(f"   Active orders  : {total_orders} (cancelled excluded: {len(all_orders)
 EXCLUDED_TITLES = [
     'USED', 'Test', 'Hidden', 'Gearevo Kydex', 'PRE-ORDER',
     'Gearevo Belt', 'Servis Asah', 'Service Asah', 'Laser Engraving',
-    'T-Shirt', 'Personalize Stylish', 'Gearevo Cap',
+    'T-Shirt', 'Knife Sheath', 'Personalize Stylish', 'Gearevo Cap',
     'Knife Sheath for f. herder', 'Kydex sheath for F. Herder',
-    'Knife Sheath for F. Herder',
 ]
 
 print(f"\n📦 Fetching ending inventory retail value...")
@@ -173,8 +172,8 @@ try:
 
     for product in all_products:
         title = product.get("title", "")
-        # Skip excluded titles (substring match)
-        if any(ex.lower() in title.lower() for ex in EXCLUDED_TITLES):
+        # Skip excluded titles — case-sensitive to match ShopifyQL NOT CONTAINS behavior
+        if any(ex in title for ex in EXCLUDED_TITLES):
             continue
         for variant in product.get("variants", []):
             # Only count variants where inventory is actually tracked by Shopify
