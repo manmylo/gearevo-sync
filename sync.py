@@ -169,6 +169,7 @@ try:
 
     print(f"   Total products fetched: {len(all_products)}")
 
+    inv_rows = []
     for product in all_products:
         title = product.get("title", "")
         # Skip excluded titles — case-sensitive to match ShopifyQL NOT CONTAINS behavior
@@ -181,9 +182,19 @@ try:
             qty = int(variant.get("inventory_quantity", 0) or 0)
             price = float(variant.get("price", 0) or 0)
             if qty >= 1:
-                ending_inventory_retail_value += qty * price
+                value = qty * price
+                ending_inventory_retail_value += value
+                inv_rows.append((title, qty, price, value))
 
-    print(f"   ✅ Ending Inventory Retail Value: RM{ending_inventory_retail_value:.2f}")
+    # Print full inventory list sorted by value
+    inv_rows.sort(key=lambda x: -x[3])
+    print(f"\n   {'Product':<60} {'Qty':>6} {'Price':>10} {'Value':>12}")
+    print(f"   {'-'*92}")
+    for t, q, p, v in inv_rows:
+        print(f"   {t[:60]:<60} {q:>6} {p:>10.2f} {v:>12.2f}")
+    print(f"   {'-'*92}")
+    print(f"   TOTAL: RM {ending_inventory_retail_value:,.2f}")
+    print(f"\n   ✅ Ending Inventory Retail Value: RM{ending_inventory_retail_value:.2f}")
 
 except Exception as e:
     print(f"   ❌ Inventory fetch error: {e}")
