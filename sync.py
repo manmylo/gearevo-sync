@@ -149,27 +149,25 @@ print(f"\n📦 Fetching ending inventory retail value...")
 ending_inventory_retail_value = 0.0
 
 try:
-    inv_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json"
-    inv_params = {
-        "limit": 250,
-        "status": "any",
-    }
     all_products = []
-    while inv_url:
-        inv_resp = requests.get(inv_url, params=inv_params, headers=headers)
-        if inv_resp.status_code != 200:
-            print(f"   ❌ Shopify API error {inv_resp.status_code}: {inv_resp.text}")
-            break
-        batch = inv_resp.json().get("products", [])
-        all_products.extend(batch)
-        link = inv_resp.headers.get("Link", "")
-        inv_url = None
-        inv_params = {}
-        if 'rel="next"' in link:
-            for part in link.split(","):
-                if 'rel="next"' in part:
-                    inv_url = part.split(";")[0].strip().strip("<>")
-                    break
+    for status in ["active", "draft"]:
+        inv_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json"
+        inv_params = {"limit": 250, "status": status}
+        while inv_url:
+            inv_resp = requests.get(inv_url, params=inv_params, headers=headers)
+            if inv_resp.status_code != 200:
+                print(f"   ❌ Shopify API error {inv_resp.status_code}: {inv_resp.text}")
+                break
+            batch = inv_resp.json().get("products", [])
+            all_products.extend(batch)
+            link = inv_resp.headers.get("Link", "")
+            inv_url = None
+            inv_params = {}
+            if 'rel="next"' in link:
+                for part in link.split(","):
+                    if 'rel="next"' in part:
+                        inv_url = part.split(";")[0].strip().strip("<>")
+                        break
 
     print(f"   Total products fetched: {len(all_products)}")
 
