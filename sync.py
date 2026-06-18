@@ -152,8 +152,7 @@ try:
     inv_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json"
     inv_params = {
         "limit": 250,
-        "published_status": "published",
-        "status": "active",
+        "status": "any",
     }
     all_products = []
     while inv_url:
