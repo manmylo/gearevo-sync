@@ -23,9 +23,17 @@ cred = credentials.Certificate(FIREBASE_CREDS)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-headers = {
+# ── REST headers (used for inventory only) ───────────────────
+rest_headers = {
     "X-Shopify-Access-Token": SHOPIFY_TOKEN,
     "Content-Type": "application/json"
+}
+
+# ── GraphQL endpoint + headers ───────────────────────────────
+GRAPHQL_URL = f"https://{SHOPIFY_STORE}/admin/api/2026-01/graphql.json"
+gql_headers = {
+    "X-Shopify-Access-Token": SHOPIFY_TOKEN,
+    "Content-Type": "application/json",
 }
 
 # ── Malaysia timezone (UTC+8) ────────────────────────────────
@@ -33,14 +41,138 @@ MY_TZ = timezone(timedelta(hours=8))
 now_my = datetime.now(MY_TZ)
 today_str = now_my.strftime("%Y-%m-%d")
 
-start_my  = datetime(now_my.year, now_my.month, now_my.day, 0, 0, 0, tzinfo=MY_TZ)
-start_utc = start_my.astimezone(timezone.utc)
-end_utc   = now_my.astimezone(timezone.utc)
-start_str = start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-end_str   = end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-print(f"📅 {today_str} | Window: 12:00 AM → {now_my.strftime('%I:%M:%S %p')} MYT")
+print(f"📅 {today_str} | Now: {now_my.strftime('%I:%M:%S %p')} MYT")
 print(f"🔧 Mode: {'FULL SYNC (+ Shopify Backfill)' if FULL_SYNC else 'QUICK SYNC (today + Excel)'}")
+
+
+# ══════════════════════════════════════════════════════════════
+# ── ShopifyQL helper ──────────────────────────────────────────
+# Uses the shopifyqlQuery GraphQL endpoint — the ONLY source
+# that matches what Shopify's Analytics dashboard shows.
+#
+# REQUIRES:  read_reports  scope on your custom app.
+#
+# net_sales  = gross_sales - discounts - returns
+#             (no taxes, no shipping — matches Analytics exactly)
+# gross_sales = price × quantity  (before discounts/returns)
+# orders     = count of orders (excl. test/cancelled depends on
+#              Shopify's own filter — matches dashboard)
+# ══════════════════════════════════════════════════════════════
+
+def shopifyql_query(shopifyql: str) -> dict:
+    """
+    Execute a ShopifyQL query via the GraphQL Admin API.
+    Returns parsed tableData as {col_name: value} for the first row,
+    or a dict of all rows keyed by date if there are multiple rows.
+    Raises on HTTP error or parse errors.
+    """
+    gql = """
+    query RunShopifyQL($q: String!) {
+      shopifyqlQuery(query: $q) {
+        tableData {
+          columns { name dataType displayName }
+          rows
+        }
+        parseErrors
+      }
+    }
+    """
+    payload = {"query": gql, "variables": {"q": shopifyql}}
+    resp = requests.post(GRAPHQL_URL, headers=gql_headers, json=payload, timeout=30)
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"ShopifyQL HTTP {resp.status_code}: {resp.text[:400]}")
+
+    body = resp.json()
+
+    # Surface GraphQL-level errors
+    if "errors" in body:
+        raise RuntimeError(f"ShopifyQL GraphQL errors: {body['errors']}")
+
+    result = body.get("data", {}).get("shopifyqlQuery", {})
+    parse_errors = result.get("parseErrors") or []
+    if parse_errors:
+        raise RuntimeError(f"ShopifyQL parse errors: {parse_errors}")
+
+    table = result.get("tableData")
+    if not table:
+        return {}
+
+    columns = [c["name"] for c in table.get("columns", [])]
+    rows    = table.get("rows", [])
+
+    if not rows:
+        return {}
+
+    # Single-row result → flat dict
+    if len(rows) == 1:
+        row = rows[0]
+        return {col: row.get(col) for col in columns}
+
+    # Multi-row result → list of flat dicts
+    return [
+        {col: row.get(col) for col in columns}
+        for row in rows
+    ]
+
+
+def fetch_shopifyql_for_date(target_date_str: str) -> dict:
+    """
+    Fetch net_sales, gross_sales, returns, discounts, orders for a single
+    calendar day in MYT.  Date string = 'YYYY-MM-DD'.
+
+    ShopifyQL SINCE/UNTIL are INCLUSIVE calendar-day boundaries in the
+    store's local timezone — no UTC conversion needed, which is exactly
+    why the numbers match Analytics.
+
+    Returns dict with keys:
+        net_sales, gross_sales, returns, discounts, orders
+    All monetary values are float (RM). orders is int.
+    Returns zeros on failure (logged).
+    """
+    shopifyql = (
+        f"FROM sales "
+        f"SHOW net_sales, gross_sales, returns, discounts, orders "
+        f"SINCE {target_date_str} UNTIL {target_date_str}"
+    )
+    print(f"   🔍 ShopifyQL: {shopifyql}")
+    try:
+        raw = shopifyql_query(shopifyql)
+    except RuntimeError as e:
+        print(f"   ❌ ShopifyQL error: {e}")
+        return {"net_sales": 0.0, "gross_sales": 0.0,
+                "returns": 0.0, "discounts": 0.0, "orders": 0}
+
+    if not raw:
+        print(f"   ⚠️  No data returned for {target_date_str}")
+        return {"net_sales": 0.0, "gross_sales": 0.0,
+                "returns": 0.0, "discounts": 0.0, "orders": 0}
+
+    def safe_float(val):
+        try: return round(float(val), 2)
+        except (TypeError, ValueError): return 0.0
+
+    def safe_int(val):
+        try: return int(float(val))
+        except (TypeError, ValueError): return 0
+
+    result = {
+        "net_sales":   safe_float(raw.get("net_sales")),
+        "gross_sales": safe_float(raw.get("gross_sales")),
+        "returns":     safe_float(raw.get("returns")),
+        "discounts":   safe_float(raw.get("discounts")),
+        "orders":      safe_int(raw.get("orders")),
+    }
+
+    print(
+        f"   ✅ net=RM{result['net_sales']:.2f} | "
+        f"gross=RM{result['gross_sales']:.2f} | "
+        f"returns=RM{result['returns']:.2f} | "
+        f"discounts=RM{result['discounts']:.2f} | "
+        f"orders={result['orders']}"
+    )
+    return result
+
 
 # ── STEP 1: Read Excel for today's row ───────────────────────
 last_year_sale  = 0.0
@@ -61,7 +193,7 @@ try:
     target_col   = next((c for c in excel_df.columns if "target" in c), None)
     forecast_col = next((c for c in excel_df.columns if "forecast" in c), None)
 
-    print(f"   Excel columns  : {list(excel_df.columns)}")
+    print(f"\n📊 Excel columns  : {list(excel_df.columns)}")
     print(f"   Date col       : {date_col}")
     print(f"   Last year col  : {lastyear_col}")
     print(f"   Forecast col   : {forecast_col}")
@@ -100,43 +232,31 @@ except FileNotFoundError:
 except Exception as e:
     print(f"   ❌ Excel read error: {e}")
 
-# ── STEP 2: Fetch Shopify orders (today) ──────────────────────
-print(f"\n📦 Fetching Shopify orders...")
 
-all_orders = []
-url    = f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json"
-params = {
-    "created_at_min": start_str,
-    "created_at_max": end_str,
-    "status":           "any",
-    "financial_status": "any",
-    "limit":            250,
-    "fields":           "id,order_number,subtotal_price,total_discounts,financial_status,cancel_reason,refunds",
-}
+# ── STEP 2: Fetch today's sales via ShopifyQL ─────────────────
+print(f"\n📦 Fetching today's sales via ShopifyQL Analytics API...")
+today_shopify = fetch_shopifyql_for_date(today_str)
 
-while url:
-    response = requests.get(url, params=params, headers=headers)
-    if response.status_code != 200:
-        print(f"❌ Shopify API error {response.status_code}: {response.text}")
-        exit(1)
-    batch = response.json().get("orders", [])
-    all_orders.extend(batch)
-    print(f"   Page: {len(batch)} orders (total: {len(all_orders)})")
-    link   = response.headers.get("Link", "")
-    url    = None
-    params = {}
-    if 'rel="next"' in link:
-        for part in link.split(","):
-            if 'rel="next"' in part:
-                url = part.split(";")[0].strip().strip("<>")
-                break
+current_sale  = today_shopify["net_sales"]
+gross_sale    = today_shopify["gross_sales"]
+total_returns = today_shopify["returns"]
+total_discounts = today_shopify["discounts"]
+total_orders  = today_shopify["orders"]
 
-active_orders = [o for o in all_orders if o.get("cancel_reason") is None]
-total_orders  = len(active_orders)
+print(f"\n📊 Today's summary:")
+print(f"   Net Sales (current) : RM{current_sale:.2f}  ← matches Analytics 'Net sales'")
+print(f"   Gross Sales         : RM{gross_sale:.2f}")
+print(f"   Returns             : RM{total_returns:.2f}")
+print(f"   Discounts           : RM{total_discounts:.2f}")
+print(f"   Orders              : {total_orders}")
+print(f"   Last Year           : RM{last_year_sale:.2f}")
+print(f"   Forecast            : RM{daily_forecast:.2f}")
+print(f"   Target              : RM{daily_target:.2f}")
 
-print(f"   Active orders  : {total_orders} (cancelled excluded: {len(all_orders) - total_orders})")
 
 # ── STEP 2.5: Fetch Ending Inventory Retail Value ────────────
+# Inventory is still fetched via REST Products API — no ShopifyQL
+# equivalent for inventory_quantity × price.
 EXCLUDED_TITLES = [
     'USED', 'Test', 'Hidden', 'Gearevo Kydex', 'PRE-ORDER',
     'Gearevo Belt', 'Servis Asah', 'Service Asah', 'Laser Engraving',
@@ -152,7 +272,7 @@ try:
     inv_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json"
     inv_params = {"limit": 250, "status": "active"}
     while inv_url:
-        inv_resp = requests.get(inv_url, params=inv_params, headers=headers)
+        inv_resp = requests.get(inv_url, params=inv_params, headers=rest_headers)
         if inv_resp.status_code != 200:
             print(f"   ❌ Shopify API error {inv_resp.status_code}: {inv_resp.text}")
             break
@@ -176,7 +296,6 @@ try:
         if any(ex in title for ex in EXCLUDED_TITLES):
             continue
         for variant in product.get("variants", []):
-            # Only count variants where inventory is actually tracked by Shopify
             if variant.get("inventory_management") != "shopify":
                 continue
             qty = int(variant.get("inventory_quantity", 0) or 0)
@@ -186,7 +305,6 @@ try:
                 ending_inventory_retail_value += value
                 inv_rows.append((title, qty, price, value))
 
-    # Print full inventory list sorted by value
     inv_rows.sort(key=lambda x: -x[3])
     print(f"\n   {'Product':<60} {'Qty':>6} {'Price':>10} {'Value':>12}")
     print(f"   {'-'*92}")
@@ -199,74 +317,22 @@ try:
 except Exception as e:
     print(f"   ❌ Inventory fetch error: {e}")
 
-# ── STEP 3: Per-order breakdown + totals ─────────────────────
-print(f"\n{'─'*75}")
-print(f"{'Order':<10} {'Subtotal':>12} {'Returns':>12} {'Net':>12}  Status")
-print(f"{'─'*75}")
 
-current_sale  = 0.0
-total_returns = 0.0
-
-for o in active_orders:
-    order_num     = o.get("order_number", o["id"])
-    subtotal      = float(o.get("subtotal_price", 0))
-    order_returns = sum(
-        float(rli.get("subtotal", 0))
-        for refund in o.get("refunds", [])
-        for rli in refund.get("refund_line_items", [])
-    )
-    order_net     = subtotal - order_returns
-    current_sale  += order_net
-    total_returns += order_returns
-
-    refund_flag = " ↩" if order_returns > 0 else ""
-    print(f"#{order_num:<9} {subtotal:>12.2f} {order_returns:>12.2f} {order_net:>12.2f}  {o.get('financial_status','')}{refund_flag}")
-
-gross_sale = sum(
-    float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0))
-    for o in all_orders
-)
-total_discounts = sum(float(o.get("total_discounts", 0)) for o in all_orders)
-
-cancelled_orders = [o for o in all_orders if o.get("cancel_reason") is not None]
-cancelled_total  = sum(
-    float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0))
-    for o in cancelled_orders
-)
-
-print(f"{'─'*75}")
-print(f"{'ACTIVE':<10} {current_sale + total_returns:>12.2f} {total_returns:>12.2f} {current_sale:>12.2f}")
-if cancelled_orders:
-    print(f"{'CANCELLED':<10} {cancelled_total:>12.2f} {'—':>12} {'—':>12}  ({len(cancelled_orders)} orders)")
-print(f"{'GROSS':<10} {gross_sale:>12.2f}  (incl. discounts RM{total_discounts:.2f})")
-print(f"{'─'*75}")
-
-print(f"\n📊 Summary:")
-print(f"   Gross       : RM{gross_sale:.2f}  ← all orders incl. cancelled + discounts")
-print(f"   Discounts   : RM{total_discounts:.2f}")
-print(f"   Cancelled   : RM{cancelled_total:.2f}  ({len(cancelled_orders)} orders)")
-print(f"   Returns     : -RM{total_returns:.2f}")
-print(f"   Current     : RM{current_sale:.2f}  ← active orders minus returns")
-print(f"   Last Year   : RM{last_year_sale:.2f}")
-print(f"   Forecast    : RM{daily_forecast:.2f}")
-print(f"   Target      : RM{daily_target:.2f}")
-print(f"   Inventory   : RM{ending_inventory_retail_value:.2f}")
-
+# ── STEP 3: Push today to Firestore ──────────────────────────
 updated_at = now_my.strftime("%H:%M:%S")
 
-# ── STEP 4: Push today to Firestore ──────────────────────────
-# Batch write = 1 commit for 2 documents
 today_data = {
-    "currentSale":   float(f"{current_sale:.2f}"),
-    "grossSale":     float(f"{gross_sale:.2f}"),
-    "totalRefunds":  float(f"{total_returns:.2f}"),
-    "totalOrders":   total_orders,
-    "lastYearSale":  float(f"{last_year_sale:.2f}"),
-    "dailyForecast": float(f"{daily_forecast:.2f}"),
-    "dailyTarget":   float(f"{daily_target:.2f}"),
-    "endingInventory": float(f"{ending_inventory_retail_value:.2f}"),
-    "syncedAt":      now_my.isoformat(),
-    "source":        "shopify",
+    "currentSale":    round(current_sale, 2),
+    "grossSale":      round(gross_sale, 2),
+    "totalRefunds":   round(total_returns, 2),
+    "totalDiscounts": round(total_discounts, 2),
+    "totalOrders":    total_orders,
+    "lastYearSale":   round(last_year_sale, 2),
+    "dailyForecast":  round(daily_forecast, 2),
+    "dailyTarget":    round(daily_target, 2),
+    "endingInventory": round(ending_inventory_retail_value, 2),
+    "syncedAt":       now_my.isoformat(),
+    "source":         "shopify",
 }
 
 wb = db.batch()
@@ -277,11 +343,10 @@ wb.set(db.collection("sales").document("daily").collection("days").document(toda
 wb.commit()
 
 print(f"\n✅ Firestore synced (today) — 1 batch commit (2 docs)")
-print(f"🔥 Gross RM{gross_sale:.2f} | Current RM{current_sale:.2f} | LY RM{last_year_sale:.2f} | Forecast RM{daily_forecast:.2f} | Target RM{daily_target:.2f} | Orders {total_orders}")
+print(f"🔥 Net RM{current_sale:.2f} | Gross RM{gross_sale:.2f} | LY RM{last_year_sale:.2f} | Forecast RM{daily_forecast:.2f} | Target RM{daily_target:.2f} | Orders {total_orders}")
 
 
-# ── Helper functions (used by sync request + backfill) ────────
-
+# ── Helper: Excel lookup ──────────────────────────────────────
 def excel_lookup(lookup_date):
     """Return (lastYearSale, dailyForecast, dailyTarget) from the Excel DataFrame."""
     ly  = 0.0
@@ -312,68 +377,8 @@ def excel_lookup(lookup_date):
     return ly, fc, tgt
 
 
-def fetch_shopify_orders_for_date(target_date):
-    """Fetch all Shopify orders for a single MYT day."""
-    day_start_my  = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=MY_TZ)
-    day_end_my    = day_start_my + timedelta(days=1)
-    day_start_utc = day_start_my.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    day_end_utc   = day_end_my.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    orders = []
-    url    = f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json"
-    p      = {
-        "created_at_min": day_start_utc,
-        "created_at_max": day_end_utc,
-        "status":           "any",
-        "financial_status": "any",
-        "limit":            250,
-        "fields":           "id,order_number,subtotal_price,total_discounts,financial_status,cancel_reason,refunds",
-    }
-
-    while url:
-        resp = requests.get(url, params=p, headers=headers)
-        if resp.status_code == 429:
-            retry_after = float(resp.headers.get("Retry-After", 2))
-            print(f"      ⏳ Rate limited, waiting {retry_after}s...")
-            time.sleep(retry_after)
-            continue
-        if resp.status_code != 200:
-            print(f"      ❌ Shopify API error {resp.status_code}: {resp.text}")
-            return None
-        batch = resp.json().get("orders", [])
-        orders.extend(batch)
-        link = resp.headers.get("Link", "")
-        url  = None
-        p    = {}
-        if 'rel="next"' in link:
-            for part in link.split(","):
-                if 'rel="next"' in part:
-                    url = part.split(";")[0].strip().strip("<>")
-                    break
-
-    gross = sum(
-        float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0))
-        for o in orders
-    )
-
-    active = [o for o in orders if o.get("cancel_reason") is None]
-    current_total = 0.0
-    refunds_total = 0.0
-    for o in active:
-        subtotal = float(o.get("subtotal_price", 0))
-        order_refunds = sum(
-            float(rli.get("subtotal", 0))
-            for refund in o.get("refunds", [])
-            for rli in refund.get("refund_line_items", [])
-        )
-        current_total += subtotal - order_refunds
-        refunds_total += order_refunds
-
-    return current_total, gross, refunds_total, len(active)
-
-
 # ══════════════════════════════════════════════════════════════
-# ── STEP 4.5: Check for manual sync requests ─────────────────
+# ── STEP 4: Check for manual sync requests ───────────────────
 # Runs on EVERY cron. Checks sales/syncRequest for pending jobs.
 # ══════════════════════════════════════════════════════════════
 
@@ -391,7 +396,6 @@ try:
             print(f"🔄 MANUAL SYNC REQUEST: {from_date} → {to_date}")
             print(f"{'═'*65}")
 
-            # Mark as processing
             sync_req_ref.set({"status": "processing", "startedAt": now_my.isoformat()}, merge=True)
 
             req_synced = 0
@@ -399,49 +403,39 @@ try:
             while d <= to_date:
                 ds = d.strftime("%Y-%m-%d")
 
-                # Skip future dates
                 if d > now_my.date():
                     print(f"   ⏭  {ds} — future date, skipping")
                     d += timedelta(days=1)
                     continue
 
-                # Skip today — already synced in Step 4
                 if d == now_my.date():
                     print(f"   ⏭  {ds} — today (already synced)")
                     d += timedelta(days=1)
                     continue
 
-                print(f"   📦 {ds} — fetching from Shopify...", end=" ")
-                result = fetch_shopify_orders_for_date(d)
-
-                if result is None:
-                    print("FAILED")
-                    d += timedelta(days=1)
-                    continue
-
-                net, gross_d, refunds_d, order_count = result
+                print(f"   📦 {ds} — fetching via ShopifyQL...", end=" ", flush=True)
+                shopify_data = fetch_shopifyql_for_date(ds)
                 ly, fc, tgt = excel_lookup(d)
 
                 doc_ref = db.collection("sales").document("daily").collection("days").document(ds)
                 doc_ref.set({
-                    "date":          ds,
-                    "currentSale":   float(f"{net:.2f}"),
-                    "grossSale":     float(f"{gross_d:.2f}"),
-                    "totalRefunds":  float(f"{refunds_d:.2f}"),
-                    "totalOrders":   order_count,
-                    "lastYearSale":  float(f"{ly:.2f}"),
-                    "dailyForecast": float(f"{fc:.2f}"),
-                    "dailyTarget":   float(f"{tgt:.2f}"),
-                    "syncedAt":      now_my.isoformat(),
-                    "source":        "shopify",
+                    "date":           ds,
+                    "currentSale":    shopify_data["net_sales"],
+                    "grossSale":      shopify_data["gross_sales"],
+                    "totalRefunds":   shopify_data["returns"],
+                    "totalDiscounts": shopify_data["discounts"],
+                    "totalOrders":    shopify_data["orders"],
+                    "lastYearSale":   round(ly, 2),
+                    "dailyForecast":  round(fc, 2),
+                    "dailyTarget":    round(tgt, 2),
+                    "syncedAt":       now_my.isoformat(),
+                    "source":         "shopify",
                 })
 
-                print(f"✅ Current RM{net:.2f} | Orders {order_count}")
                 req_synced += 1
-                time.sleep(0.5)
+                time.sleep(0.5)   # ShopifyQL has its own rate limit bucket
                 d += timedelta(days=1)
 
-            # Mark as completed
             sync_req_ref.set({
                 "status": "completed",
                 "completedAt": now_my.isoformat(),
@@ -456,19 +450,14 @@ except Exception as e:
 
 # ══════════════════════════════════════════════════════════════
 # ── STEP 5: Sync Excel rows to Firestore (hash-gated) ────────
-# Computes a hash of the Excel file. If unchanged since last
-# sync, skips entirely (1 read only). If changed, reads all
-# existing docs, compares, and writes only changed rows.
-# Empty Excel cells are never written (preserves Firestore data).
 # ══════════════════════════════════════════════════════════════
 import hashlib
 
 excel_synced = 0
 excel_skipped = 0
-existing_docs = {}   # shared with FULL_SYNC backfill below
+existing_docs = {}
 
 try:
-    # Compute hash of Excel file
     excel_hash = ""
     try:
         with open("Sales_and_Target.xlsx", "rb") as f:
@@ -477,7 +466,6 @@ try:
         excel_hash = ""
 
     if excel_hash and excel_df is not None and date_col is not None:
-        # Read stored hash (1 read)
         hash_ref = db.collection("sales").document("excelSyncHash")
         hash_doc = hash_ref.get()
         stored_hash = hash_doc.to_dict().get("hash", "") if hash_doc.exists else ""
@@ -489,7 +477,6 @@ try:
             print(f"📊 EXCEL SYNC: File changed — syncing to Firestore")
             print(f"{'═'*65}")
 
-            # Cache all existing daily docs in one read
             days_ref = db.collection("sales").document("daily").collection("days")
             for doc in days_ref.stream():
                 existing_docs[doc.id] = doc.to_dict()
@@ -507,7 +494,6 @@ try:
                 if ds == today_str:
                     continue
 
-                # Build update dict — ONLY include non-empty Excel cells
                 update = {"date": ds}
                 if lastyear_col and pd.notna(erow[lastyear_col]):
                     update["lastYearSale"] = float(f"{float(erow[lastyear_col]):.2f}")
@@ -516,12 +502,10 @@ try:
                 if target_col and pd.notna(erow[target_col]):
                     update["dailyTarget"] = float(f"{float(erow[target_col]):.2f}")
 
-                # Nothing to write (all Excel cells empty for this row)
-                if len(update) <= 1:  # only "date" key
+                if len(update) <= 1:
                     excel_skipped += 1
                     continue
 
-                # Compare with existing — skip if all values are the same
                 existing = existing_docs.get(ds)
                 if existing:
                     all_same = True
@@ -534,17 +518,16 @@ try:
                     if all_same:
                         excel_skipped += 1
                         continue
-                    # Merge only the changed fields (preserves Shopify data)
                     wb.set(days_ref.document(ds), update, merge=True)
                 else:
-                    # New doc — create with Excel data + zeroed Shopify fields
                     new_doc = {
-                        "currentSale":   0.0,
-                        "grossSale":     0.0,
-                        "totalRefunds":  0.0,
-                        "totalOrders":   0,
-                        "syncedAt":      now_my.isoformat(),
-                        "source":        "excel",
+                        "currentSale":    0.0,
+                        "grossSale":      0.0,
+                        "totalRefunds":   0.0,
+                        "totalDiscounts": 0.0,
+                        "totalOrders":    0,
+                        "syncedAt":       now_my.isoformat(),
+                        "source":         "excel",
                     }
                     new_doc.update(update)
                     wb.set(days_ref.document(ds), new_doc)
@@ -552,14 +535,12 @@ try:
                 excel_synced += 1
                 batch_count += 1
 
-                # Firestore batch limit is 500
                 if batch_count >= 490:
                     wb.commit()
                     print(f"   📤 Committed batch of {batch_count} writes")
                     wb = db.batch()
                     batch_count = 0
 
-            # Save new hash in same batch
             wb.set(hash_ref, {"hash": excel_hash, "syncedAt": now_my.isoformat()})
             batch_count += 1
 
@@ -577,7 +558,6 @@ except Exception as e:
 
 # ══════════════════════════════════════════════════════════════
 # BELOW ONLY RUNS ON FULL_SYNC (push to main / manual trigger)
-# Cron runs stop here.
 # ══════════════════════════════════════════════════════════════
 
 if not FULL_SYNC:
@@ -586,13 +566,13 @@ if not FULL_SYNC:
     sys.exit(0)
 
 
-# ── STEP 6: Historical Shopify backfill ──────────────────────
-# Uses existing_docs cache — load if not already populated
+# ── STEP 6: Historical Shopify backfill via ShopifyQL ────────
 if not existing_docs:
     days_ref = db.collection("sales").document("daily").collection("days")
     for doc in days_ref.stream():
         existing_docs[doc.id] = doc.to_dict()
     print(f"   📖 Loaded {len(existing_docs)} existing docs for backfill")
+
 HISTORY_START = date(2026, 3, 27)   # Day 61
 HISTORY_END   = date(2026, 5, 27)
 
@@ -600,9 +580,7 @@ print(f"\n{'═'*65}")
 print(f"📜 HISTORICAL BACKFILL: {HISTORY_START} → {HISTORY_END}")
 print(f"{'═'*65}")
 
-
-# ── Loop — uses existing_docs cache, zero extra reads ────────
-today_date = now_my.date()
+today_date   = now_my.date()
 current_date = HISTORY_START
 synced  = 0
 skipped = 0
@@ -618,39 +596,32 @@ while current_date <= HISTORY_END:
         current_date += timedelta(days=1)
         continue
 
-    # Use cache — no Firestore read
     existing = existing_docs.get(ds)
     if existing and existing.get("source") == "shopify":
         skipped += 1
         current_date += timedelta(days=1)
         continue
 
-    print(f"   📦 {ds} — fetching from Shopify...", end=" ")
-    result = fetch_shopify_orders_for_date(current_date)
-
-    if result is None:
-        print("FAILED — skipping")
-        current_date += timedelta(days=1)
-        continue
-
-    net, gross, refunds, order_count = result
+    print(f"   📦 {ds} — fetching via ShopifyQL...", end=" ", flush=True)
+    shopify_data = fetch_shopifyql_for_date(ds)
     ly, fc, tgt = excel_lookup(current_date)
 
     doc_ref = db.collection("sales").document("daily").collection("days").document(ds)
     doc_ref.set({
-        "date":          ds,
-        "currentSale":   float(f"{net:.2f}"),
-        "grossSale":     float(f"{gross:.2f}"),
-        "totalRefunds":  float(f"{refunds:.2f}"),
-        "totalOrders":   order_count,
-        "lastYearSale":  float(f"{ly:.2f}"),
-        "dailyForecast": float(f"{fc:.2f}"),
-        "dailyTarget":   float(f"{tgt:.2f}"),
-        "syncedAt":      now_my.isoformat(),
-        "source":        "shopify",
+        "date":           ds,
+        "currentSale":    shopify_data["net_sales"],
+        "grossSale":      shopify_data["gross_sales"],
+        "totalRefunds":   shopify_data["returns"],
+        "totalDiscounts": shopify_data["discounts"],
+        "totalOrders":    shopify_data["orders"],
+        "lastYearSale":   round(ly, 2),
+        "dailyForecast":  round(fc, 2),
+        "dailyTarget":    round(tgt, 2),
+        "syncedAt":       now_my.isoformat(),
+        "source":         "shopify",
     })
 
-    print(f"✅ Gross RM{gross:.2f} | Current RM{net:.2f} | Orders {order_count} | LY RM{ly:.2f} | Forecast RM{fc:.2f} | Tgt RM{tgt:.2f}")
+    print(f"✅ Net RM{shopify_data['net_sales']:.2f} | Gross RM{shopify_data['gross_sales']:.2f} | Orders {shopify_data['orders']} | LY RM{ly:.2f}")
     synced += 1
 
     time.sleep(0.5)
