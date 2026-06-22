@@ -163,8 +163,15 @@ EXCLUDED_TITLES = [
     'Gearevo Cap',
     'Knife Sheath',           # catches "18 inch Knife Sheath Made from Nylon" etc.
     'Kydex sheath for F. Herder',
-    'Kydex Sheath (GE-K',     # catches GE-Kx sheaths stored at secondary location
-                              # (not tracked by Shopify Analytics on this plan)
+]
+
+# Kydex Sheaths stored at secondary location — not counted by Shopify Analytics.
+# 7 Kydex Sheaths ARE in Shopify (GE-K2, K6, K13, K16, K22, K32, K33) — keep those.
+EXCLUDED_KYDEX = [
+    'GE-K3-', 'GE-K4-', 'GE-K5-', 'GE-K7-', 'GE-K8-', 'GE-K9-',
+    'GE-K10-', 'GE-K11-', 'GE-K12-', 'GE-K14-', 'GE-K15-',
+    'GE-K17-', 'GE-K19-', 'GE-K20-', 'GE-K21-',
+    'GE-K26-', 'GE-K27-', 'GE-K34-',
 ]
 
 GRAPHQL_URL = f"https://{SHOPIFY_STORE}/admin/api/2024-04/graphql.json"
@@ -231,6 +238,9 @@ try:
             title = pe["node"]["title"]
             # Skip excluded — case-sensitive to match ShopifyQL NOT CONTAINS
             if any(ex in title for ex in EXCLUDED_TITLES):
+                continue
+            # Skip specific Kydex Sheaths at secondary location
+            if any(code in title for code in EXCLUDED_KYDEX):
                 continue
             for ve in pe["node"]["variants"]["edges"]:
                 v = ve["node"]
