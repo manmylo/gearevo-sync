@@ -201,12 +201,20 @@ query getProducts($cursor: String) {
 """
 
 print(f"\n📦 Fetching ending inventory retail value (GraphQL)...")
+
+# Diagnostics + safety state
 ending_inventory_retail_value = 0.0
+inv_rows               = []
+pages                  = 0
+inventory_complete     = True          # flips False on any early break / error
+excl_title_val         = 0.0           # value removed by EXCLUDED_TITLES
+excl_kydex_val         = 0.0           # value removed by EXCLUDED_KYDEX
+untracked_skipped_val  = 0.0           # value of untracked variants in counted products
+excl_title_cnt         = 0
+excl_kydex_cnt         = 0
 
 try:
-    inv_rows = []
     cursor = None
-    pages = 0
 
     while True:
         variables = {"cursor": cursor} if cursor else {}
@@ -222,11 +230,13 @@ try:
             continue
         if inv_resp.status_code != 200:
             print(f"   ❌ GraphQL error {inv_resp.status_code}: {inv_resp.text[:200]}")
+            inventory_complete = False
             break
 
         data = inv_resp.json()
         if "errors" in data:
             print(f"   ❌ GraphQL errors: {data['errors']}")
+            inventory_complete = False
             break
 
         products_data = data.get("data", {}).get("products", {})
@@ -236,24 +246,40 @@ try:
 
         for pe in edges:
             title = pe["node"]["title"]
-            # Skip excluded — case-sensitive to match ShopifyQL NOT CONTAINS
-            if any(ex in title for ex in EXCLUDED_TITLES):
-                continue
-            # Skip specific Kydex Sheaths at secondary location
-            if any(code in title for code in EXCLUDED_KYDEX):
-                continue
+
+            # Compute this product's counted value first (tracked, qty >= 1),
+            # so we can attribute it to an exclusion bucket if it's skipped.
+            counted       = 0.0
+            untracked_val = 0.0
+            prod_rows     = []
             for ve in pe["node"]["variants"]["edges"]:
                 v = ve["node"]
+                qty   = int(v.get("inventoryQuantity") or 0)
+                price = float(v.get("price") or 0)
                 tracked = v.get("inventoryItem", {}).get("tracked", False)
                 if not tracked:
+                    if qty > 0:
+                        untracked_val += qty * price
                     continue
-                qty = int(v.get("inventoryQuantity") or 0)
                 if qty < 1:
                     continue
-                price = float(v.get("price") or 0)
-                value = qty * price
-                ending_inventory_retail_value += value
-                inv_rows.append((title, qty, price, value))
+                val = qty * price
+                counted += val
+                prod_rows.append((title, qty, price, val))
+
+            # Exclusions — case-sensitive to match ShopifyQL NOT CONTAINS
+            if any(ex in title for ex in EXCLUDED_TITLES):
+                excl_title_val += counted
+                excl_title_cnt += 1
+                continue
+            if any(code in title for code in EXCLUDED_KYDEX):
+                excl_kydex_val += counted
+                excl_kydex_cnt += 1
+                continue
+
+            ending_inventory_retail_value += counted
+            untracked_skipped_val += untracked_val
+            inv_rows.extend(prod_rows)
 
         if not page_info.get("hasNextPage"):
             break
@@ -267,11 +293,32 @@ try:
         print(f"   {t[:60]:<60} {q:>6} {p:>10.2f} {v:>12.2f}")
     print(f"   {'-'*92}")
     print(f"   Pages fetched  : {pages}")
-    print(f"   TOTAL: RM {ending_inventory_retail_value:,.2f}")
-    print(f"\n   ✅ Ending Inventory Retail Value: RM{ending_inventory_retail_value:.2f}")
+    print(f"   TOTAL (counted): RM {ending_inventory_retail_value:,.2f}")
+
+    # Where the value went — compare these against your Shopify gap
+    print(f"\n   ── Excluded-value breakdown ──")
+    print(f"   By title list  : RM {excl_title_val:>12,.2f}  ({excl_title_cnt} products)")
+    print(f"   By Kydex list  : RM {excl_kydex_val:>12,.2f}  ({excl_kydex_cnt} products)")
+    print(f"   Untracked vars : RM {untracked_skipped_val:>12,.2f}  (in counted products)")
+    print(f"   Raw (counted + title + kydex): RM {ending_inventory_retail_value + excl_title_val + excl_kydex_val:,.2f}")
 
 except Exception as e:
     print(f"   ❌ Inventory fetch error: {e}")
+    inventory_complete = False
+
+# ── Safety: never let a partial/failed fetch overwrite a good value ──
+if not inventory_complete:
+    print(f"   ⚠️  Inventory fetch INCOMPLETE (pages={pages}) — will not overwrite last good value")
+    try:
+        prev = db.collection("sales").document("today").get()
+        prev_val = float(prev.to_dict().get("endingInventory", 0)) if prev.exists else 0.0
+    except Exception:
+        prev_val = 0.0
+    if prev_val > 0:
+        print(f"   ↩  Preserving previous endingInventory: RM{prev_val:,.2f} (computed partial was RM{ending_inventory_retail_value:,.2f})")
+        ending_inventory_retail_value = prev_val
+
+print(f"\n   {'✅' if inventory_complete else '⚠️'} Ending Inventory Retail Value: RM{ending_inventory_retail_value:.2f}  (complete={inventory_complete})")
 
 # ── STEP 3: Per-order breakdown + totals ─────────────────────
 print(f"\n{'─'*75}")
@@ -339,6 +386,8 @@ today_data = {
     "dailyForecast": float(f"{daily_forecast:.2f}"),
     "dailyTarget":   float(f"{daily_target:.2f}"),
     "endingInventory": float(f"{ending_inventory_retail_value:.2f}"),
+    "endingInventoryComplete": inventory_complete,
+    "inventoryPages": pages,
     "syncedAt":      now_my.isoformat(),
     "source":        "shopify",
 }
