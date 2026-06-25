@@ -100,41 +100,118 @@ except FileNotFoundError:
 except Exception as e:
     print(f"   ❌ Excel read error: {e}")
 
+# ── Daily metrics helper ─────────────────────────────────────
+# Net sales matches Shopify Analytics:
+#   • sales (subtotal after discount) counted on the ORDER's date
+#   • returns counted on the REFUND's processed date (NOT the order's date)
+#   • order count INCLUDES cancelled orders (to match Shopify's order count)
+def _fetch_orders(query_params):
+    """Paginate Shopify orders for the given params. Returns list, or None on error."""
+    out = []
+    page_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json"
+    p = dict(query_params)
+    while page_url:
+        resp = requests.get(page_url, params=p, headers=headers)
+        if resp.status_code == 429:
+            time.sleep(float(resp.headers.get("Retry-After", 2)))
+            continue
+        if resp.status_code != 200:
+            print(f"   ❌ Shopify API error {resp.status_code}: {resp.text[:200]}")
+            return None
+        out.extend(resp.json().get("orders", []))
+        link = resp.headers.get("Link", "")
+        page_url = None
+        p = {}
+        if 'rel="next"' in link:
+            for part in link.split(","):
+                if 'rel="next"' in part:
+                    page_url = part.split(";")[0].strip().strip("<>")
+                    break
+    return out
+
+
+def _parse_dt(s):
+    """Parse a Shopify ISO timestamp to an aware UTC datetime (or None)."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def compute_day_metrics(day_start_my, day_end_my):
+    """Compute one MYT window's sales the way Shopify net sales does."""
+    start_utc = day_start_my.astimezone(timezone.utc)
+    end_utc   = day_end_my.astimezone(timezone.utc)
+    start_str = start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str   = end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # 1) Orders CREATED in the window -> sales + order count
+    created = _fetch_orders({
+        "created_at_min": start_str, "created_at_max": end_str,
+        "status": "any", "financial_status": "any", "limit": 250,
+        "fields": "id,order_number,subtotal_price,total_discounts,financial_status,cancel_reason",
+    })
+    # 2) Orders UPDATED in the window -> refunds processed in the window (any order, any date)
+    updated = _fetch_orders({
+        "updated_at_min": start_str, "updated_at_max": end_str,
+        "status": "any", "financial_status": "any", "limit": 250,
+        "fields": "id,order_number,created_at,refunds",
+    })
+    if created is None or updated is None:
+        return None
+
+    active    = [o for o in created if o.get("cancel_reason") is None]
+    cancelled = [o for o in created if o.get("cancel_reason") is not None]
+
+    subtotal_sum    = sum(float(o.get("subtotal_price", 0)) for o in active)
+    discounts       = sum(float(o.get("total_discounts", 0)) for o in created)
+    gross           = sum(float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0)) for o in created)
+    cancelled_total = sum(float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0)) for o in cancelled)
+
+    # Refunds whose processed/created date falls inside this window
+    refunds_in_window = 0.0
+    for o in updated:
+        for refund in o.get("refunds", []):
+            rdt = _parse_dt(refund.get("processed_at") or refund.get("created_at"))
+            if rdt is not None and start_utc <= rdt < end_utc:
+                refunds_in_window += sum(float(rli.get("subtotal", 0)) for rli in refund.get("refund_line_items", []))
+
+    return {
+        "net":             subtotal_sum - refunds_in_window,
+        "gross":           gross,
+        "subtotal":        subtotal_sum,
+        "discounts":       discounts,
+        "refunds":         refunds_in_window,
+        "order_count":     len(created),        # incl. cancelled - matches Shopify
+        "active_count":    len(active),
+        "cancelled_count": len(cancelled),
+        "cancelled_total": cancelled_total,
+    }
+
+
 # ── STEP 2: Fetch Shopify orders (today) ──────────────────────
-print(f"\n📦 Fetching Shopify orders...")
+print(f"\n📦 Fetching Shopify orders (net sales = sales by order date − refunds by refund date)...")
 
-all_orders = []
-url    = f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json"
-params = {
-    "created_at_min": start_str,
-    "created_at_max": end_str,
-    "status":           "any",
-    "financial_status": "any",
-    "limit":            250,
-    "fields":           "id,order_number,subtotal_price,total_discounts,financial_status,cancel_reason,refunds",
-}
+day = compute_day_metrics(start_my, now_my)
+if day is None:
+    print("❌ Could not fetch today's orders")
+    exit(1)
 
-while url:
-    response = requests.get(url, params=params, headers=headers)
-    if response.status_code != 200:
-        print(f"❌ Shopify API error {response.status_code}: {response.text}")
-        exit(1)
-    batch = response.json().get("orders", [])
-    all_orders.extend(batch)
-    print(f"   Page: {len(batch)} orders (total: {len(all_orders)})")
-    link   = response.headers.get("Link", "")
-    url    = None
-    params = {}
-    if 'rel="next"' in link:
-        for part in link.split(","):
-            if 'rel="next"' in part:
-                url = part.split(";")[0].strip().strip("<>")
-                break
+current_sale    = day["net"]
+gross_sale      = day["gross"]
+total_returns   = day["refunds"]
+total_orders    = day["order_count"]
+total_discounts = day["discounts"]
+cancelled_count = day["cancelled_count"]
+cancelled_total = day["cancelled_total"]
 
-active_orders = [o for o in all_orders if o.get("cancel_reason") is None]
-total_orders  = len(active_orders)
-
-print(f"   Active orders  : {total_orders} (cancelled excluded: {len(all_orders) - total_orders})")
+print(f"   Orders         : {total_orders}  (active {day['active_count']}, cancelled {cancelled_count})")
+print(f"   Refunds today  : RM{total_returns:.2f}  (dated by refund processed date)")
 
 # ── STEP 2.5: Fetch Ending Inventory Retail Value ────────────
 # Mirrors the ShopifyQL query used in Analytics:
@@ -278,54 +355,14 @@ try:
 except Exception as e:
     print(f"   ❌ Inventory fetch error: {e}")
 
-# ── STEP 3: Per-order breakdown + totals ─────────────────────
-print(f"\n{'─'*75}")
-print(f"{'Order':<10} {'Subtotal':>12} {'Returns':>12} {'Net':>12}  Status")
-print(f"{'─'*75}")
-
-current_sale  = 0.0
-total_returns = 0.0
-
-for o in active_orders:
-    order_num     = o.get("order_number", o["id"])
-    subtotal      = float(o.get("subtotal_price", 0))
-    order_returns = sum(
-        float(rli.get("subtotal", 0))
-        for refund in o.get("refunds", [])
-        for rli in refund.get("refund_line_items", [])
-    )
-    order_net     = subtotal - order_returns
-    current_sale  += order_net
-    total_returns += order_returns
-
-    refund_flag = " ↩" if order_returns > 0 else ""
-    print(f"#{order_num:<9} {subtotal:>12.2f} {order_returns:>12.2f} {order_net:>12.2f}  {o.get('financial_status','')}{refund_flag}")
-
-gross_sale = sum(
-    float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0))
-    for o in all_orders
-)
-total_discounts = sum(float(o.get("total_discounts", 0)) for o in all_orders)
-
-cancelled_orders = [o for o in all_orders if o.get("cancel_reason") is not None]
-cancelled_total  = sum(
-    float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0))
-    for o in cancelled_orders
-)
-
-print(f"{'─'*75}")
-print(f"{'ACTIVE':<10} {current_sale + total_returns:>12.2f} {total_returns:>12.2f} {current_sale:>12.2f}")
-if cancelled_orders:
-    print(f"{'CANCELLED':<10} {cancelled_total:>12.2f} {'—':>12} {'—':>12}  ({len(cancelled_orders)} orders)")
-print(f"{'GROSS':<10} {gross_sale:>12.2f}  (incl. discounts RM{total_discounts:.2f})")
-print(f"{'─'*75}")
-
+# ── STEP 3: Daily summary ────────────────────────
 print(f"\n📊 Summary:")
-print(f"   Gross       : RM{gross_sale:.2f}  ← all orders incl. cancelled + discounts")
+print(f"   Gross       : RM{gross_sale:.2f}  ← all orders (incl. cancelled) + discounts")
 print(f"   Discounts   : RM{total_discounts:.2f}")
-print(f"   Cancelled   : RM{cancelled_total:.2f}  ({len(cancelled_orders)} orders)")
-print(f"   Returns     : -RM{total_returns:.2f}")
-print(f"   Current     : RM{current_sale:.2f}  ← active orders minus returns")
+print(f"   Cancelled   : RM{cancelled_total:.2f}  ({cancelled_count} orders)")
+print(f"   Returns     : -RM{total_returns:.2f}  ← refunds dated today")
+print(f"   Current     : RM{current_sale:.2f}  ← net sales (subtotal − refunds dated today)")
+print(f"   Orders      : {total_orders}  (incl. cancelled, matches Shopify)")
 print(f"   Last Year   : RM{last_year_sale:.2f}")
 print(f"   Forecast    : RM{daily_forecast:.2f}")
 print(f"   Target      : RM{daily_target:.2f}")
@@ -392,63 +429,13 @@ def excel_lookup(lookup_date):
 
 
 def fetch_shopify_orders_for_date(target_date):
-    """Fetch all Shopify orders for a single MYT day."""
-    day_start_my  = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=MY_TZ)
-    day_end_my    = day_start_my + timedelta(days=1)
-    day_start_utc = day_start_my.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    day_end_utc   = day_end_my.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    orders = []
-    url    = f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json"
-    p      = {
-        "created_at_min": day_start_utc,
-        "created_at_max": day_end_utc,
-        "status":           "any",
-        "financial_status": "any",
-        "limit":            250,
-        "fields":           "id,order_number,subtotal_price,total_discounts,financial_status,cancel_reason,refunds",
-    }
-
-    while url:
-        resp = requests.get(url, params=p, headers=headers)
-        if resp.status_code == 429:
-            retry_after = float(resp.headers.get("Retry-After", 2))
-            print(f"      ⏳ Rate limited, waiting {retry_after}s...")
-            time.sleep(retry_after)
-            continue
-        if resp.status_code != 200:
-            print(f"      ❌ Shopify API error {resp.status_code}: {resp.text}")
-            return None
-        batch = resp.json().get("orders", [])
-        orders.extend(batch)
-        link = resp.headers.get("Link", "")
-        url  = None
-        p    = {}
-        if 'rel="next"' in link:
-            for part in link.split(","):
-                if 'rel="next"' in part:
-                    url = part.split(";")[0].strip().strip("<>")
-                    break
-
-    gross = sum(
-        float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0))
-        for o in orders
-    )
-
-    active = [o for o in orders if o.get("cancel_reason") is None]
-    current_total = 0.0
-    refunds_total = 0.0
-    for o in active:
-        subtotal = float(o.get("subtotal_price", 0))
-        order_refunds = sum(
-            float(rli.get("subtotal", 0))
-            for refund in o.get("refunds", [])
-            for rli in refund.get("refund_line_items", [])
-        )
-        current_total += subtotal - order_refunds
-        refunds_total += order_refunds
-
-    return current_total, gross, refunds_total, len(active)
+    """One MYT day's metrics (net sales matches Shopify). Returns (net, gross, refunds, order_count)."""
+    day_start_my = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=MY_TZ)
+    day_end_my   = day_start_my + timedelta(days=1)
+    m = compute_day_metrics(day_start_my, day_end_my)
+    if m is None:
+        return None
+    return m["net"], m["gross"], m["refunds"], m["order_count"]
 
 
 # ══════════════════════════════════════════════════════════════
