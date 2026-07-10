@@ -43,14 +43,15 @@ print(f"[DATE] {today_str} | Window: 12:00 AM -> {now_my.strftime('%I:%M:%S %p')
 print(f"[MODE] {'FULL SYNC (+ Shopify Backfill)' if FULL_SYNC else 'QUICK SYNC (today + Excel)'}")
 
 # ---- STEP 1: Read Excel for today's row ----------------------------------------------------
+# NOTE: dailyTarget is no longer read from Excel at all. The Calendar (CEO
+# Dashboard) is now the sole source of truth for daily targets, written
+# directly to Firestore client-side. This script only ever reads
+# lastYearSale and dailyForecast from the Excel sheet.
 last_year_sale  = 0.0
-daily_target    = 0.0
-daily_target_explicit = False   # True only when today's Excel row has a real target cell
 daily_forecast  = 0.0
 excel_df        = None
 date_col        = None
 lastyear_col    = None
-target_col      = None
 forecast_col    = None
 
 try:
@@ -59,14 +60,12 @@ try:
 
     date_col     = next((c for c in excel_df.columns if "date" in c), None)
     lastyear_col = next((c for c in excel_df.columns if "last" in c and "year" in c or "last_year" in c), None)
-    target_col   = next((c for c in excel_df.columns if "target" in c), None)
     forecast_col = next((c for c in excel_df.columns if "forecast" in c), None)
 
     print(f"   Excel columns  : {list(excel_df.columns)}")
     print(f"   Date col       : {date_col}")
     print(f"   Last year col  : {lastyear_col}")
     print(f"   Forecast col   : {forecast_col}")
-    print(f"   Target col     : {target_col}")
 
     if date_col and lastyear_col:
         excel_df[date_col] = pd.to_datetime(excel_df[date_col], dayfirst=True, errors="coerce")
@@ -80,18 +79,7 @@ try:
                 fval = row[forecast_col].values[0]
                 daily_forecast = float(fval) if pd.notna(fval) and float(fval) > 0 else 0.0
 
-            if target_col:
-                target_val = row[target_col].values[0]
-                if pd.notna(target_val) and float(target_val) > 0:
-                    daily_target = float(target_val)
-                    daily_target_explicit = True
-                else:
-                    past = excel_df[(excel_df[date_col] <= today_dt) & excel_df[target_col].notna() & (excel_df[target_col] > 0)]
-                    if not past.empty:
-                        daily_target = float(past.iloc[-1][target_col])
-                        print(f"   [WARN] No target for today -> using last known: RM{daily_target:.2f}")
-
-            print(f"   [OK] Excel match : LastYear=RM{last_year_sale:.2f} | Forecast=RM{daily_forecast:.2f} | Target=RM{daily_target:.2f}")
+            print(f"   [OK] Excel match : LastYear=RM{last_year_sale:.2f} | Forecast=RM{daily_forecast:.2f}")
         else:
             print(f"   [WARN] No row found for {today_str} in Excel -> using 0")
     else:
@@ -371,13 +359,15 @@ print(f"   Current     : RM{current_sale:.2f}  -- net sales (subtotal - refunds 
 print(f"   Orders      : {total_orders}  (incl. cancelled, matches Shopify)")
 print(f"   Last Year   : RM{last_year_sale:.2f}")
 print(f"   Forecast    : RM{daily_forecast:.2f}")
-print(f"   Target      : RM{daily_target:.2f}")
 print(f"   Inventory   : RM{ending_inventory_retail_value:.2f}")
 
 updated_at = now_my.strftime("%H:%M:%S")
 
 # ---- STEP 4: Push today to Firestore ----------------------------------------------------
 # Batch write = 1 commit for 2 documents
+# dailyTarget is intentionally never written here -- it's Calendar-only now
+# (see note at Step 1). merge=True means this write never touches whatever
+# dailyTarget value is already sitting on these docs.
 today_data = {
     "currentSale":   float(f"{current_sale:.2f}"),
     "grossSale":     float(f"{gross_sale:.2f}"),
@@ -389,11 +379,6 @@ today_data = {
     "syncedAt":      now_my.isoformat(),
     "source":        "shopify",
 }
-# Only push dailyTarget from Excel when today's row actually has a real value.
-# Otherwise leave the field alone -- it may have been set live via the
-# CEO Dashboard Calendar, and this cron shouldn't stomp that on every run.
-if daily_target_explicit:
-    today_data["dailyTarget"] = float(f"{daily_target:.2f}")
 
 wb = db.batch()
 wb.set(db.collection("sales").document("today"),
@@ -403,19 +388,17 @@ wb.set(db.collection("sales").document("daily").collection("days").document(toda
 wb.commit()
 
 print(f"\n[OK] Firestore synced (today) -- 1 batch commit (2 docs)")
-print(f"[RESULT] Gross RM{gross_sale:.2f} | Current RM{current_sale:.2f} | LY RM{last_year_sale:.2f} | Forecast RM{daily_forecast:.2f} | Target RM{daily_target:.2f} | Orders {total_orders}")
+print(f"[RESULT] Gross RM{gross_sale:.2f} | Current RM{current_sale:.2f} | LY RM{last_year_sale:.2f} | Forecast RM{daily_forecast:.2f} | Orders {total_orders}")
 
 
 # ---- Helper functions (used by sync request + backfill) ----------------------------------------------------
 
 def excel_lookup(lookup_date):
-    """Return (lastYearSale, dailyForecast, dailyTarget, dailyTargetExplicit) from the Excel DataFrame."""
+    """Return (lastYearSale, dailyForecast) from the Excel DataFrame. No target -- Calendar-only now."""
     ly  = 0.0
     fc  = 0.0
-    tgt = 0.0
-    tgt_explicit = False
     if excel_df is None or date_col is None or lastyear_col is None:
-        return ly, fc, tgt, tgt_explicit
+        return ly, fc
 
     dt = pd.Timestamp(lookup_date.year, lookup_date.month, lookup_date.day)
     row = excel_df[excel_df[date_col] == dt]
@@ -427,17 +410,7 @@ def excel_lookup(lookup_date):
         if forecast_col:
             fval = row[forecast_col].values[0]
             fc = float(fval) if pd.notna(fval) and float(fval) > 0 else 0.0
-
-        if target_col:
-            tval = row[target_col].values[0]
-            if pd.notna(tval) and float(tval) > 0:
-                tgt = float(tval)
-                tgt_explicit = True
-            else:
-                past = excel_df[(excel_df[date_col] <= dt) & excel_df[target_col].notna() & (excel_df[target_col] > 0)]
-                if not past.empty:
-                    tgt = float(past.iloc[-1][target_col])
-    return ly, fc, tgt, tgt_explicit
+    return ly, fc
 
 
 def fetch_shopify_orders_for_date(target_date):
@@ -498,10 +471,12 @@ try:
                     continue
 
                 net, gross_d, refunds_d, order_count = result
-                ly, fc, tgt, tgt_explicit = excel_lookup(d)
+                ly, fc = excel_lookup(d)
 
+                # dailyTarget deliberately omitted -- Calendar-only, and merge=True
+                # means this write never touches whatever's already there.
                 doc_ref = db.collection("sales").document("daily").collection("days").document(ds)
-                day_data = {
+                doc_ref.set({
                     "date":          ds,
                     "currentSale":   float(f"{net:.2f}"),
                     "grossSale":     float(f"{gross_d:.2f}"),
@@ -511,13 +486,7 @@ try:
                     "dailyForecast": float(f"{fc:.2f}"),
                     "syncedAt":      now_my.isoformat(),
                     "source":        "shopify",
-                }
-                # Same rule as Step 4: only push dailyTarget from Excel when this
-                # date's row actually has a real value, so a Calendar-set target
-                # for this date survives a manual resync.
-                if tgt_explicit:
-                    day_data["dailyTarget"] = float(f"{tgt:.2f}")
-                doc_ref.set(day_data, merge=True)
+                }, merge=True)
 
                 print(f"[OK] Current RM{net:.2f} | Orders {order_count}")
                 req_synced += 1
@@ -590,14 +559,13 @@ try:
                 if ds == today_str:
                     continue
 
-                # Build update dict -- ONLY include non-empty Excel cells
+                # Build update dict -- ONLY include non-empty Excel cells.
+                # dailyTarget is never written here -- Calendar-only now.
                 update = {"date": ds}
                 if lastyear_col and pd.notna(erow[lastyear_col]):
                     update["lastYearSale"] = float(f"{float(erow[lastyear_col]):.2f}")
                 if forecast_col and pd.notna(erow[forecast_col]):
                     update["dailyForecast"] = float(f"{float(erow[forecast_col]):.2f}")
-                if target_col and pd.notna(erow[target_col]):
-                    update["dailyTarget"] = float(f"{float(erow[target_col]):.2f}")
 
                 # Nothing to write (all Excel cells empty for this row)
                 if len(update) <= 1:  # only "date" key
@@ -717,10 +685,12 @@ while current_date <= HISTORY_END:
         continue
 
     net, gross, refunds, order_count = result
-    ly, fc, tgt, tgt_explicit = excel_lookup(current_date)
+    ly, fc = excel_lookup(current_date)
 
+    # dailyTarget deliberately omitted -- Calendar-only, and merge=True means
+    # this write never touches whatever's already there.
     doc_ref = db.collection("sales").document("daily").collection("days").document(ds)
-    day_data = {
+    doc_ref.set({
         "date":          ds,
         "currentSale":   float(f"{net:.2f}"),
         "grossSale":     float(f"{gross:.2f}"),
@@ -730,12 +700,9 @@ while current_date <= HISTORY_END:
         "dailyForecast": float(f"{fc:.2f}"),
         "syncedAt":      now_my.isoformat(),
         "source":        "shopify",
-    }
-    if tgt_explicit:
-        day_data["dailyTarget"] = float(f"{tgt:.2f}")
-    doc_ref.set(day_data, merge=True)
+    }, merge=True)
 
-    print(f"[OK] Gross RM{gross:.2f} | Current RM{net:.2f} | Orders {order_count} | LY RM{ly:.2f} | Forecast RM{fc:.2f} | Tgt RM{tgt:.2f}")
+    print(f"[OK] Gross RM{gross:.2f} | Current RM{net:.2f} | Orders {order_count} | LY RM{ly:.2f} | Forecast RM{fc:.2f}")
     synced += 1
 
     time.sleep(0.5)
