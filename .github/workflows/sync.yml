@@ -6,6 +6,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: sync-shopify
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
