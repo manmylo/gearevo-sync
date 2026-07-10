@@ -424,6 +424,63 @@ def fetch_shopify_orders_for_date(target_date):
 
 
 # ------------------------------------------------------------------------------
+# ---- STEP 4B: Finalize yesterday (first sync of each day only) --------------
+# Every other cron tick only ever computes TODAY's numbers (Step 2/4) --
+# yesterday's figure is whatever the last tick of that day happened to
+# produce, which can miss refunds/adjustments Shopify processes right around
+# midnight. On the first sync of a new MYT day, re-fetch yesterday's FULL day
+# from Shopify fresh and overwrite it with the authoritative final numbers.
+# Gated by sales/syncState.lastYesterdayFinalizeDate so this only runs once
+# per day, not on every cron tick (which would otherwise hammer Shopify for
+# no reason). If the fetch fails, the gate is left untouched so the very next
+# cron tick retries instead of silently giving up for the whole day.
+# ------------------------------------------------------------------------------
+
+try:
+    sync_state_ref = db.collection("sales").document("syncState")
+    sync_state = sync_state_ref.get()
+    last_finalized = sync_state.to_dict().get("lastYesterdayFinalizeDate", "") if sync_state.exists else ""
+
+    if last_finalized != today_str:
+        yesterday_date = now_my.date() - timedelta(days=1)
+        yesterday_str = yesterday_date.strftime("%Y-%m-%d")
+
+        print(f"\n{'='*65}")
+        print(f"[FINALIZE] First sync of {today_str} -> re-fetching yesterday ({yesterday_str}) from Shopify")
+        print(f"{'='*65}")
+
+        result = fetch_shopify_orders_for_date(yesterday_date)
+        if result is not None:
+            net, gross_y, refunds_y, order_count_y = result
+            ly, fc = excel_lookup(yesterday_date)
+
+            # dailyTarget deliberately omitted -- Calendar-only, and merge=True
+            # means this write never touches whatever's already there.
+            doc_ref = db.collection("sales").document("daily").collection("days").document(yesterday_str)
+            doc_ref.set({
+                "date":          yesterday_str,
+                "currentSale":   float(f"{net:.2f}"),
+                "grossSale":     float(f"{gross_y:.2f}"),
+                "totalRefunds":  float(f"{refunds_y:.2f}"),
+                "totalOrders":   order_count_y,
+                "lastYearSale":  float(f"{ly:.2f}"),
+                "dailyForecast": float(f"{fc:.2f}"),
+                "syncedAt":      now_my.isoformat(),
+                "source":        "shopify",
+            }, merge=True)
+
+            sync_state_ref.set({"lastYesterdayFinalizeDate": today_str}, merge=True)
+            print(f"   [OK] Finalized {yesterday_str}: Current RM{net:.2f} | Orders {order_count_y}")
+        else:
+            print(f"   [ERROR] Could not fetch yesterday's orders -- will retry on next cron tick")
+    else:
+        print(f"\n[FINALIZE] Yesterday already finalized today -> skipped")
+
+except Exception as e:
+    print(f"\n[WARN] Yesterday finalize check failed: {e}")
+
+
+# ------------------------------------------------------------------------------
 # ---- STEP 4.5: Check for manual sync requests --------------------------------
 # Runs on EVERY cron. Checks sales/syncRequest for pending jobs.
 # ------------------------------------------------------------------------------
