@@ -409,12 +409,13 @@ print(f"[RESULT] Gross RM{gross_sale:.2f} | Current RM{current_sale:.2f} | LY RM
 # ---- Helper functions (used by sync request + backfill) ----------------------------------------------------
 
 def excel_lookup(lookup_date):
-    """Return (lastYearSale, dailyForecast, dailyTarget) from the Excel DataFrame."""
+    """Return (lastYearSale, dailyForecast, dailyTarget, dailyTargetExplicit) from the Excel DataFrame."""
     ly  = 0.0
     fc  = 0.0
     tgt = 0.0
+    tgt_explicit = False
     if excel_df is None or date_col is None or lastyear_col is None:
-        return ly, fc, tgt
+        return ly, fc, tgt, tgt_explicit
 
     dt = pd.Timestamp(lookup_date.year, lookup_date.month, lookup_date.day)
     row = excel_df[excel_df[date_col] == dt]
@@ -431,11 +432,12 @@ def excel_lookup(lookup_date):
             tval = row[target_col].values[0]
             if pd.notna(tval) and float(tval) > 0:
                 tgt = float(tval)
+                tgt_explicit = True
             else:
                 past = excel_df[(excel_df[date_col] <= dt) & excel_df[target_col].notna() & (excel_df[target_col] > 0)]
                 if not past.empty:
                     tgt = float(past.iloc[-1][target_col])
-    return ly, fc, tgt
+    return ly, fc, tgt, tgt_explicit
 
 
 def fetch_shopify_orders_for_date(target_date):
@@ -496,10 +498,10 @@ try:
                     continue
 
                 net, gross_d, refunds_d, order_count = result
-                ly, fc, tgt = excel_lookup(d)
+                ly, fc, tgt, tgt_explicit = excel_lookup(d)
 
                 doc_ref = db.collection("sales").document("daily").collection("days").document(ds)
-                doc_ref.set({
+                day_data = {
                     "date":          ds,
                     "currentSale":   float(f"{net:.2f}"),
                     "grossSale":     float(f"{gross_d:.2f}"),
@@ -507,10 +509,15 @@ try:
                     "totalOrders":   order_count,
                     "lastYearSale":  float(f"{ly:.2f}"),
                     "dailyForecast": float(f"{fc:.2f}"),
-                    "dailyTarget":   float(f"{tgt:.2f}"),
                     "syncedAt":      now_my.isoformat(),
                     "source":        "shopify",
-                })
+                }
+                # Same rule as Step 4: only push dailyTarget from Excel when this
+                # date's row actually has a real value, so a Calendar-set target
+                # for this date survives a manual resync.
+                if tgt_explicit:
+                    day_data["dailyTarget"] = float(f"{tgt:.2f}")
+                doc_ref.set(day_data, merge=True)
 
                 print(f"[OK] Current RM{net:.2f} | Orders {order_count}")
                 req_synced += 1
@@ -710,10 +717,10 @@ while current_date <= HISTORY_END:
         continue
 
     net, gross, refunds, order_count = result
-    ly, fc, tgt = excel_lookup(current_date)
+    ly, fc, tgt, tgt_explicit = excel_lookup(current_date)
 
     doc_ref = db.collection("sales").document("daily").collection("days").document(ds)
-    doc_ref.set({
+    day_data = {
         "date":          ds,
         "currentSale":   float(f"{net:.2f}"),
         "grossSale":     float(f"{gross:.2f}"),
@@ -721,10 +728,12 @@ while current_date <= HISTORY_END:
         "totalOrders":   order_count,
         "lastYearSale":  float(f"{ly:.2f}"),
         "dailyForecast": float(f"{fc:.2f}"),
-        "dailyTarget":   float(f"{tgt:.2f}"),
         "syncedAt":      now_my.isoformat(),
         "source":        "shopify",
-    })
+    }
+    if tgt_explicit:
+        day_data["dailyTarget"] = float(f"{tgt:.2f}")
+    doc_ref.set(day_data, merge=True)
 
     print(f"[OK] Gross RM{gross:.2f} | Current RM{net:.2f} | Orders {order_count} | LY RM{ly:.2f} | Forecast RM{fc:.2f} | Tgt RM{tgt:.2f}")
     synced += 1
