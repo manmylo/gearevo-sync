@@ -27,6 +27,12 @@ headers = {
     "X-Shopify-Access-Token": SHOPIFY_TOKEN,
     "Content-Type": "application/json"
 }
+# NOTE: ShopifyQL queries (compute_day_metrics below, and the inventory query
+# further down) require the read_reports scope on this token/app, in addition
+# to whatever order/product scopes it already has. If that scope isn't
+# granted, every ShopifyQL call will fail -- check the Shopify custom app's
+# API scopes if compute_day_metrics starts erroring after this change.
+GRAPHQL_URL = f"https://{SHOPIFY_STORE}/admin/api/2024-04/graphql.json"
 
 # ---- Malaysia timezone (UTC+8) ----------------------------------------------------
 MY_TZ = timezone(timedelta(hours=8))
@@ -91,105 +97,92 @@ except Exception as e:
     print(f"   [ERROR] Excel read error: {e}")
 
 # ---- Daily metrics helper ----------------------------------------------------
-# Net sales matches Shopify Analytics:
-#   - sales (subtotal after discount) counted on the ORDER's date
-#   - returns counted on the REFUND's processed date (NOT the order's date)
-#   - order count INCLUDES cancelled orders (to match Shopify's order count)
-def _fetch_orders(query_params):
-    """Paginate Shopify orders for the given params. Returns list, or None on error."""
-    out = []
-    page_url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/orders.json"
-    p = dict(query_params)
-    while page_url:
-        resp = requests.get(page_url, params=p, headers=headers)
-        if resp.status_code == 429:
-            time.sleep(float(resp.headers.get("Retry-After", 2)))
-            continue
-        if resp.status_code != 200:
-            print(f"   [ERROR] Shopify API error {resp.status_code}: {resp.text[:200]}")
-            return None
-        out.extend(resp.json().get("orders", []))
-        link = resp.headers.get("Link", "")
-        page_url = None
-        p = {}
-        if 'rel="next"' in link:
-            for part in link.split(","):
-                if 'rel="next"' in part:
-                    page_url = part.split(";")[0].strip().strip("<>")
-                    break
-    return out
-
-
-def _parse_dt(s):
-    """Parse a Shopify ISO timestamp to an aware UTC datetime (or None)."""
-    if not s:
+# Uses ShopifyQL (the `sales` table -- Shopify's actual sales ledger, the same
+# thing that powers Shopify's own Analytics/Reports), NOT a reconstruction
+# from Orders REST/GraphQL fields.
+#
+# Why: reconstructing "net sales" from Orders fields (subtotal_price, and a
+# separate refunds[] scan) can only ever see two kinds of event -- an order's
+# original creation, and formal refunds. It has NO way to see a THIRD kind of
+# event: items added to an ALREADY-PLACED order via an edit/exchange. There is
+# no Orders-API field for "a line item was added to this order today" at all.
+# So any order that gets edited after its creation day -- a common real-world
+# case (a customer exchanges a knife for a different model, say) -- was
+# silently undercounted, no matter how the REST queries were tuned. This was
+# root-caused directly against Shopify's own ShopifyQL "Net sales by order"
+# report: one edited order accounted for the entire gap between this script's
+# number and Shopify Analytics' number for the same day.
+#
+# ShopifyQL's `sales` table records each of the three event types (sale,
+# refund, edit-addition) individually, each dated by when it actually
+# happened -- exactly matching how Shopify's own dashboards attribute sales,
+# and exactly the "count it on the day the transaction actually happened"
+# principle this script was already using for refunds. This is the only way
+# to get a number that matches Shopify Analytics exactly.
+#
+# Requires the read_reports scope on this Shopify app/token.
+def fetch_shopifyql(ql_query):
+    """Run one ShopifyQL query via the Admin GraphQL API. Returns the list of
+    row dicts (one dict per row, keyed by column name), or None on error."""
+    gql = {
+        "query": """
+            query($q: String!) {
+              shopifyqlQuery(query: $q) {
+                tableData { columns { name } rows }
+                parseErrors
+              }
+            }
+        """,
+        "variables": {"q": ql_query},
+    }
+    resp = requests.post(GRAPHQL_URL, headers=headers, json=gql)
+    if resp.status_code == 429:
+        time.sleep(float(resp.headers.get("Retry-After", 2)))
+        resp = requests.post(GRAPHQL_URL, headers=headers, json=gql)
+    if resp.status_code != 200:
+        print(f"   [ERROR] ShopifyQL HTTP error {resp.status_code}: {resp.text[:300]}")
         return None
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except ValueError:
+    data = resp.json()
+    if "errors" in data:
+        print(f"   [ERROR] ShopifyQL GraphQL errors: {data['errors']}")
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    result = data.get("data", {}).get("shopifyqlQuery") or {}
+    if result.get("parseErrors"):
+        print(f"   [ERROR] ShopifyQL parse errors: {result['parseErrors']} (query: {ql_query})")
+        return None
+    return result.get("tableData", {}).get("rows", [])
 
 
 def compute_day_metrics(day_start_my, day_end_my):
-    """Compute one MYT window's sales the way Shopify net sales does."""
-    start_utc = day_start_my.astimezone(timezone.utc)
-    end_utc   = day_end_my.astimezone(timezone.utc)
-    start_str = start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_str   = end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    # 1) Orders CREATED in the window -> sales + order count
-    created = _fetch_orders({
-        "created_at_min": start_str, "created_at_max": end_str,
-        "status": "any", "financial_status": "any", "limit": 250,
-        "fields": "id,order_number,subtotal_price,total_discounts,financial_status,cancel_reason",
-    })
-    # 2) Orders UPDATED in the window -> refunds processed in the window (any order, any date)
-    updated = _fetch_orders({
-        "updated_at_min": start_str, "updated_at_max": end_str,
-        "status": "any", "financial_status": "any", "limit": 250,
-        "fields": "id,order_number,created_at,refunds",
-    })
-    if created is None or updated is None:
+    """One MYT calendar day's sales metrics via ShopifyQL. day_end_my is
+    unused (kept so callers don't need to change) -- ShopifyQL's SINCE/UNTIL
+    is date-only and always covers the full day in the store's configured
+    timezone (confirmed set to GMT+08:00 Kuala Lumpur)."""
+    date_str = day_start_my.strftime("%Y-%m-%d")
+    rows = fetch_shopifyql(
+        f"FROM sales SHOW net_sales, gross_sales, discounts, returns, orders "
+        f"SINCE {date_str} UNTIL {date_str}"
+    )
+    if rows is None:
         return None
+    if not rows:
+        return {"net": 0.0, "gross": 0.0, "discounts": 0.0, "refunds": 0.0, "order_count": 0}
 
-    active    = [o for o in created if o.get("cancel_reason") is None]
-    cancelled = [o for o in created if o.get("cancel_reason") is not None]
-
-    # Count EVERY order placed in the window as a sale on its order date (incl. ones
-    # later cancelled) -- exactly like Shopify. A cancellation is removed by its refund
-    # on the refund's date in the refunds loop below, so same-day cancels net to zero
-    # (sale +X, refund -X) and prior-day cancels correctly land as a return today.
-    subtotal_sum    = sum(float(o.get("subtotal_price", 0)) for o in created)
-    discounts       = sum(float(o.get("total_discounts", 0)) for o in created)
-    gross           = sum(float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0)) for o in created)
-    cancelled_total = sum(float(o.get("subtotal_price", 0)) + float(o.get("total_discounts", 0)) for o in cancelled)
-
-    # Refunds whose processed/created date falls inside this window
-    refunds_in_window = 0.0
-    for o in updated:
-        for refund in o.get("refunds", []):
-            rdt = _parse_dt(refund.get("processed_at") or refund.get("created_at"))
-            if rdt is not None and start_utc <= rdt < end_utc:
-                refunds_in_window += sum(float(rli.get("subtotal", 0)) for rli in refund.get("refund_line_items", []))
-
+    row = rows[0]
     return {
-        "net":             subtotal_sum - refunds_in_window,
-        "gross":           gross,
-        "subtotal":        subtotal_sum,
-        "discounts":       discounts,
-        "refunds":         refunds_in_window,
-        "order_count":     len(created),        # incl. cancelled - matches Shopify
-        "active_count":    len(active),
-        "cancelled_count": len(cancelled),
-        "cancelled_total": cancelled_total,
+        "net":         float(row.get("net_sales") or 0),
+        "gross":       float(row.get("gross_sales") or 0),
+        # discounts/returns come back as negative deltas (they're subtracted
+        # into net_sales) -- store as positive magnitudes, matching how the
+        # rest of this script (and its log output) already treats them.
+        "discounts":   abs(float(row.get("discounts") or 0)),
+        "refunds":     abs(float(row.get("returns") or 0)),
+        "order_count": int(float(row.get("orders") or 0)),
     }
 
 
 # ---- STEP 2: Fetch Shopify orders (today) ----------------------------------------------------
-print(f"\n[FETCH] Fetching Shopify orders (net sales = sales by order date - refunds by refund date)...")
+print(f"\n[FETCH] Fetching today's sales via ShopifyQL (the actual sales ledger)...")
 
 day = compute_day_metrics(start_my, now_my)
 if day is None:
@@ -201,11 +194,9 @@ gross_sale      = day["gross"]
 total_returns   = day["refunds"]
 total_orders    = day["order_count"]
 total_discounts = day["discounts"]
-cancelled_count = day["cancelled_count"]
-cancelled_total = day["cancelled_total"]
 
-print(f"   Orders         : {total_orders}  (active {day['active_count']}, cancelled {cancelled_count})")
-print(f"   Refunds today  : RM{total_returns:.2f}  (dated by refund processed date)")
+print(f"   Orders         : {total_orders}")
+print(f"   Refunds today  : RM{total_returns:.2f}  (dated by refund/edit processed date)")
 
 # ---- STEP 2.5: Fetch Ending Inventory Retail Value ----------------------------------------------------
 # Mirrors the ShopifyQL query used in Analytics:
@@ -249,8 +240,6 @@ EXCLUDED_KYDEX = []
 #     'GE-K17-', 'GE-K19-', 'GE-K20-', 'GE-K21-',
 #     'GE-K26-', 'GE-K27-', 'GE-K34-',
 # ]
-
-GRAPHQL_URL = f"https://{SHOPIFY_STORE}/admin/api/2024-04/graphql.json"
 
 INV_QUERY = """
 query getProducts($cursor: String) {
@@ -351,12 +340,11 @@ except Exception as e:
 
 # ---- STEP 3: Daily summary ----------------------------------------------------
 print(f"\n[SUMMARY]")
-print(f"   Gross       : RM{gross_sale:.2f}  -- all orders (incl. cancelled) + discounts")
+print(f"   Gross       : RM{gross_sale:.2f}")
 print(f"   Discounts   : RM{total_discounts:.2f}")
-print(f"   Cancelled   : RM{cancelled_total:.2f}  ({cancelled_count} orders)")
-print(f"   Returns     : -RM{total_returns:.2f}  -- refunds dated today")
-print(f"   Current     : RM{current_sale:.2f}  -- net sales (subtotal - refunds dated today)")
-print(f"   Orders      : {total_orders}  (incl. cancelled, matches Shopify)")
+print(f"   Returns     : -RM{total_returns:.2f}  -- refunds/edits dated today (ShopifyQL ledger)")
+print(f"   Current     : RM{current_sale:.2f}  -- net sales via ShopifyQL (matches Shopify Analytics)")
+print(f"   Orders      : {total_orders}")
 print(f"   Last Year   : RM{last_year_sale:.2f}")
 print(f"   Forecast    : RM{daily_forecast:.2f}")
 print(f"   Inventory   : RM{ending_inventory_retail_value:.2f}")
