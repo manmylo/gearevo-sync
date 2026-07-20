@@ -153,6 +153,35 @@ def fetch_shopifyql(ql_query):
     return result.get("tableData", {}).get("rows", [])
 
 
+def fetch_channel_region_breakdown(date_str):
+    """One MYT day's net sales broken down by sales channel and billing
+    region, via ShopifyQL (sales_channel/billing_region are documented
+    dimensions on the `sales` table -- see
+    https://shopify.dev/docs/api/shopifyql/shopifyql-reference). One query
+    returns one row per (channel, region) pair; summed into two separate
+    dicts client-side so each totals correctly on its own.
+
+    Best-effort: returns ({}, {}) on failure rather than raising, so a
+    breakdown hiccup never takes down the day's actual sales figure (the
+    thing that matters most) -- caller just gets an empty breakdown and an
+    [ERROR]/[WARN] line already printed by fetch_shopifyql above.
+    """
+    rows = fetch_shopifyql(
+        f"FROM sales SHOW net_sales GROUP BY sales_channel, billing_region "
+        f"SINCE {date_str} UNTIL {date_str}"
+    )
+    if not rows:
+        return {}, {}
+    channels, regions = {}, {}
+    for r in rows:
+        ch = r.get("sales_channel") or "Other"
+        reg = r.get("billing_region") or "Unknown"
+        val = float(r.get("net_sales") or 0)
+        channels[ch] = channels.get(ch, 0.0) + val
+        regions[reg] = regions.get(reg, 0.0) + val
+    return channels, regions
+
+
 def compute_day_metrics(day_start_my, day_end_my):
     """One MYT calendar day's sales metrics via ShopifyQL. day_end_my is
     unused (kept so callers don't need to change) -- ShopifyQL's SINCE/UNTIL
@@ -165,8 +194,12 @@ def compute_day_metrics(day_start_my, day_end_my):
     )
     if rows is None:
         return None
+
+    channels, regions = fetch_channel_region_breakdown(date_str)
+
     if not rows:
-        return {"net": 0.0, "gross": 0.0, "discounts": 0.0, "refunds": 0.0, "order_count": 0}
+        return {"net": 0.0, "gross": 0.0, "discounts": 0.0, "refunds": 0.0, "order_count": 0,
+                "channels": channels, "regions": regions}
 
     row = rows[0]
     return {
@@ -178,6 +211,8 @@ def compute_day_metrics(day_start_my, day_end_my):
         "discounts":   abs(float(row.get("discounts") or 0)),
         "refunds":     abs(float(row.get("returns") or 0)),
         "order_count": int(float(row.get("orders") or 0)),
+        "channels":    channels,
+        "regions":     regions,
     }
 
 
@@ -194,9 +229,13 @@ gross_sale      = day["gross"]
 total_returns   = day["refunds"]
 total_orders    = day["order_count"]
 total_discounts = day["discounts"]
+today_channels  = day["channels"]
+today_regions   = day["regions"]
 
 print(f"   Orders         : {total_orders}")
 print(f"   Refunds today  : RM{total_returns:.2f}  (dated by refund/edit processed date)")
+print(f"   Channels       : {today_channels}")
+print(f"   Regions        : {today_regions}")
 
 # ---- STEP 2.5: Fetch Ending Inventory Retail Value ----------------------------------------------------
 # Mirrors the ShopifyQL query used in Analytics:
@@ -364,6 +403,8 @@ today_data = {
     "lastYearSale":  float(f"{last_year_sale:.2f}"),
     "dailyForecast": float(f"{daily_forecast:.2f}"),
     "endingInventory": float(f"{ending_inventory_retail_value:.2f}"),
+    "channels":      today_channels,
+    "regions":       today_regions,
     "syncedAt":      now_my.isoformat(),
     "source":        "shopify",
 }
@@ -402,13 +443,14 @@ def excel_lookup(lookup_date):
 
 
 def fetch_shopify_orders_for_date(target_date):
-    """One MYT day's metrics (net sales matches Shopify). Returns (net, gross, refunds, order_count)."""
+    """One MYT day's metrics (net sales matches Shopify). Returns
+    (net, gross, refunds, order_count, channels, regions)."""
     day_start_my = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=MY_TZ)
     day_end_my   = day_start_my + timedelta(days=1)
     m = compute_day_metrics(day_start_my, day_end_my)
     if m is None:
         return None
-    return m["net"], m["gross"], m["refunds"], m["order_count"]
+    return m["net"], m["gross"], m["refunds"], m["order_count"], m["channels"], m["regions"]
 
 
 # ------------------------------------------------------------------------------
@@ -439,7 +481,7 @@ try:
 
         result = fetch_shopify_orders_for_date(yesterday_date)
         if result is not None:
-            net, gross_y, refunds_y, order_count_y = result
+            net, gross_y, refunds_y, order_count_y, channels_y, regions_y = result
             ly, fc = excel_lookup(yesterday_date)
 
             # dailyTarget deliberately omitted -- Calendar-only, and merge=True
@@ -453,6 +495,8 @@ try:
                 "totalOrders":   order_count_y,
                 "lastYearSale":  float(f"{ly:.2f}"),
                 "dailyForecast": float(f"{fc:.2f}"),
+                "channels":      channels_y,
+                "regions":       regions_y,
                 "syncedAt":      now_my.isoformat(),
                 "source":        "shopify",
             }, merge=True)
@@ -515,7 +559,7 @@ try:
                     d += timedelta(days=1)
                     continue
 
-                net, gross_d, refunds_d, order_count = result
+                net, gross_d, refunds_d, order_count, channels_d, regions_d = result
                 ly, fc = excel_lookup(d)
 
                 # dailyTarget deliberately omitted -- Calendar-only, and merge=True
@@ -529,6 +573,8 @@ try:
                     "totalOrders":   order_count,
                     "lastYearSale":  float(f"{ly:.2f}"),
                     "dailyForecast": float(f"{fc:.2f}"),
+                    "channels":      channels_d,
+                    "regions":       regions_d,
                     "syncedAt":      now_my.isoformat(),
                     "source":        "shopify",
                 }, merge=True)
@@ -716,7 +762,7 @@ while current_date <= HISTORY_END:
 
     # Use cache -- no Firestore read
     existing = existing_docs.get(ds)
-    if existing and existing.get("source") == "shopify":
+    if existing and existing.get("source") == "shopify" and "channels" in existing:
         skipped += 1
         current_date += timedelta(days=1)
         continue
@@ -729,7 +775,7 @@ while current_date <= HISTORY_END:
         current_date += timedelta(days=1)
         continue
 
-    net, gross, refunds, order_count = result
+    net, gross, refunds, order_count, channels, regions = result
     ly, fc = excel_lookup(current_date)
 
     # dailyTarget deliberately omitted -- Calendar-only, and merge=True means
@@ -743,6 +789,8 @@ while current_date <= HISTORY_END:
         "totalOrders":   order_count,
         "lastYearSale":  float(f"{ly:.2f}"),
         "dailyForecast": float(f"{fc:.2f}"),
+        "channels":      channels,
+        "regions":       regions,
         "syncedAt":      now_my.isoformat(),
         "source":        "shopify",
     }, merge=True)
