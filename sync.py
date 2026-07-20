@@ -154,7 +154,7 @@ def fetch_shopifyql(ql_query):
 
 
 def fetch_channel_region_breakdown(day_start_my, day_end_my):
-    """One MYT day's net sales broken down by sales channel and shipping
+    """One MYT day's NET sales broken down by sales channel and shipping
     region, via plain Orders GraphQL -- NOT ShopifyQL.
 
     ShopifyQL's `sales_channel` dimension turned out to group by the
@@ -168,6 +168,15 @@ def fetch_channel_region_breakdown(day_start_my, day_end_my):
     don't change on an order edit, so the edit-tracking ShopifyQL was
     introduced for (see compute_day_metrics' docstring) isn't needed here --
     plain Orders GraphQL is both correct and simpler for this one.
+
+    "Net" here means the same definitions the Worker/dashboard already use
+    elsewhere for Returns/Cancelled (see fetchMonthOrderSummary): an order
+    that was cancelled before ever shipping contributes nothing (it was
+    never really a sale), and an order that shipped but was later refunded
+    contributes its price MINUS the refunded amount. Without this, totals
+    ran well above "Sales This Month" (which nets out refunds/cancellations
+    via ShopifyQL's ledger) -- these two won't be dollar-exact (this is
+    order-creation-dated, that's event-dated) but should land close.
 
     Orders come back sorted ascending by CREATED_AT, so once a page's order
     reaches day_end, every later page is also past it -- the loop breaks
@@ -185,7 +194,10 @@ def fetch_channel_region_breakdown(day_start_my, day_end_my):
             pageInfo { hasNextPage endCursor }
             nodes {
               createdAt
+              cancelledAt
               totalPriceSet { shopMoney { amount } }
+              totalRefundedSet { shopMoney { amount } }
+              fulfillments(first: 1) { id }
               channelInformation { channelDefinition { channelName } }
               shippingAddress { province }
             }
@@ -217,11 +229,21 @@ def fetch_channel_region_breakdown(day_start_my, day_end_my):
             if created_ms >= day_end_ms:
                 hit_end = True
                 break
-            val = float((o.get("totalPriceSet") or {}).get("shopMoney", {}).get("amount") or 0)
+
+            # Cancelled before ever shipping -- never a real sale, excluded
+            # entirely (same rule "Cancelled This Month" uses elsewhere).
+            shipped = len(o.get("fulfillments") or []) > 0
+            if o.get("cancelledAt") and not shipped:
+                continue
+
+            total = float((o.get("totalPriceSet") or {}).get("shopMoney", {}).get("amount") or 0)
+            refunded = float((o.get("totalRefundedSet") or {}).get("shopMoney", {}).get("amount") or 0)
+            net = total - refunded
+
             ch = ((o.get("channelInformation") or {}).get("channelDefinition") or {}).get("channelName") or "Other"
             prov = (o.get("shippingAddress") or {}).get("province") or "Unknown"
-            channels[ch] = channels.get(ch, 0.0) + val
-            regions[prov] = regions.get(prov, 0.0) + val
+            channels[ch] = channels.get(ch, 0.0) + net
+            regions[prov] = regions.get(prov, 0.0) + net
 
         if hit_end or not page.get("pageInfo", {}).get("hasNextPage"):
             break
