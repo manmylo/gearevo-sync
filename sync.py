@@ -153,110 +153,113 @@ def fetch_shopifyql(ql_query):
     return result.get("tableData", {}).get("rows", [])
 
 
-def fetch_channel_region_breakdown(day_start_my, day_end_my):
-    """One MYT day's NET sales broken down by sales channel and shipping
-    region, via plain Orders GraphQL -- NOT ShopifyQL.
+def fetch_order_channel_region(order_names):
+    """Exact-match lookup of channel/region for a specific list of order
+    names via Orders GraphQL search (query: name:"X" OR name:"Y" ...).
 
-    ShopifyQL's `sales_channel` dimension turned out to group by the
-    connecting APP, not the per-order channel: on this store it lumped
-    Shopee/TikTok/Lazada together under one bundled connector app's name
-    ("Easy Shopee, TikTok & Lazada"), which doesn't match what the Shopify
-    admin's own Orders list shows in its "Channel" column (a plain "Shopee"
-    or "TikTok" per order). That per-order value lives at
-    Order.channelInformation.channelDefinition.channelName -- an Orders API
-    field, not exposed as a ShopifyQL dimension. Channel/shipping address
-    don't change on an order edit, so the edit-tracking ShopifyQL was
-    introduced for (see compute_day_metrics' docstring) isn't needed here --
-    plain Orders GraphQL is both correct and simpler for this one.
-
-    "Net" here means the same definitions the Worker/dashboard already use
-    elsewhere for Returns/Cancelled (see fetchMonthOrderSummary): an order
-    that was cancelled before ever shipping contributes nothing (it was
-    never really a sale), and an order that shipped but was later refunded
-    contributes its price MINUS the refunded amount. Without this, totals
-    ran well above "Sales This Month" (which nets out refunds/cancellations
-    via ShopifyQL's ledger) -- these two won't be dollar-exact (this is
-    order-creation-dated, that's event-dated) but should land close.
-
-    Orders come back sorted ascending by CREATED_AT, so once a page's order
-    reaches day_end, every later page is also past it -- the loop breaks
-    immediately instead of draining all the way to "now", which matters a
-    lot for the historical backfill (one query per day, hundreds of days).
-
-    Best-effort: returns ({}, {}) on failure rather than raising, so a
-    breakdown hiccup never takes down the day's actual sales figure (the
-    thing that matters most).
+    NOT a date-range scan -- bounded purely by len(order_names), so no
+    pagination-past-a-day-boundary concern the way a created_at-window scan
+    would have. Chunked to 20 names per query to stay well clear of any
+    search-query-length limit. Best-effort per chunk: a failed chunk just
+    means those orders fall back to "Other"/"Unknown" in the caller (their
+    net sales still count towards the right TOTAL, just not the right
+    channel/region split) -- never worth losing the money over a lookup hiccup.
     """
-    q = f"created_at:>={day_start_my.isoformat()} status:any"
+    result = {}
     query = """
         query($cursor: String, $q: String) {
-          orders(first: 50, after: $cursor, query: $q, sortKey: CREATED_AT) {
+          orders(first: 50, after: $cursor, query: $q) {
             pageInfo { hasNextPage endCursor }
             nodes {
-              createdAt
-              cancelledAt
-              totalPriceSet { shopMoney { amount } }
-              totalRefundedSet { shopMoney { amount } }
-              fulfillments(first: 1) { id }
+              name
               channelInformation { channelDefinition { channelName } }
               shippingAddress { province }
             }
           }
         }
     """
-    channels, regions = {}, {}
-    cursor = None
-    day_end_ms = day_end_my.timestamp() * 1000
-
-    while True:
-        resp = requests.post(GRAPHQL_URL, headers=headers,
-                              json={"query": query, "variables": {"cursor": cursor, "q": q}})
-        if resp.status_code == 429:
-            time.sleep(float(resp.headers.get("Retry-After", 2)))
-            continue
-        if resp.status_code != 200:
-            print(f"   [ERROR] Channel/region Orders GraphQL error {resp.status_code}: {resp.text[:200]}")
-            return channels, regions
-        data = resp.json()
-        if "errors" in data:
-            print(f"   [ERROR] Channel/region Orders GraphQL errors: {data['errors']}")
-            return channels, regions
-
-        page = data.get("data", {}).get("orders", {})
-        hit_end = False
-        for o in page.get("nodes", []):
-            created_ms = datetime.fromisoformat(o["createdAt"].replace("Z", "+00:00")).timestamp() * 1000
-            if created_ms >= day_end_ms:
-                hit_end = True
-                break
-
-            # Cancelled before ever shipping -- never a real sale, excluded
-            # entirely (same rule "Cancelled This Month" uses elsewhere).
-            shipped = len(o.get("fulfillments") or []) > 0
-            if o.get("cancelledAt") and not shipped:
+    for i in range(0, len(order_names), 20):
+        chunk = order_names[i:i + 20]
+        # Quoted so a leading '#' (Shopify order names are like "#51703")
+        # can't collide with the search parser's own syntax.
+        name_query = " OR ".join(f'name:"{n}"' for n in chunk)
+        cursor = None
+        while True:
+            resp = requests.post(GRAPHQL_URL, headers=headers,
+                                  json={"query": query, "variables": {"cursor": cursor, "q": name_query}})
+            if resp.status_code == 429:
+                time.sleep(float(resp.headers.get("Retry-After", 2)))
                 continue
+            if resp.status_code != 200:
+                print(f"   [ERROR] Order channel/region lookup HTTP error {resp.status_code}: {resp.text[:200]}")
+                break
+            data = resp.json()
+            if "errors" in data:
+                print(f"   [ERROR] Order channel/region lookup GraphQL errors: {data['errors']}")
+                break
+            page = data.get("data", {}).get("orders", {})
+            for o in page.get("nodes", []):
+                ch = ((o.get("channelInformation") or {}).get("channelDefinition") or {}).get("channelName") or "Other"
+                prov = (o.get("shippingAddress") or {}).get("province") or "Unknown"
+                result[o["name"]] = (ch, prov)
+            if not page.get("pageInfo", {}).get("hasNextPage"):
+                break
+            cursor = page.get("pageInfo", {}).get("endCursor")
 
-            total = float((o.get("totalPriceSet") or {}).get("shopMoney", {}).get("amount") or 0)
-            refunded = float((o.get("totalRefundedSet") or {}).get("shopMoney", {}).get("amount") or 0)
-            net = total - refunded
+    return result
 
-            ch = ((o.get("channelInformation") or {}).get("channelDefinition") or {}).get("channelName") or "Other"
-            prov = (o.get("shippingAddress") or {}).get("province") or "Unknown"
-            channels[ch] = channels.get(ch, 0.0) + net
-            regions[prov] = regions.get(prov, 0.0) + net
 
-        if hit_end or not page.get("pageInfo", {}).get("hasNextPage"):
-            break
-        cursor = page.get("pageInfo", {}).get("endCursor")
+def fetch_channel_region_breakdown(date_str):
+    """One MYT day's net sales broken down by sales channel and shipping
+    region -- matching "Sales This Month" EXACTLY, dollar for dollar.
 
+    Two-step, because no single Shopify data source has both things right:
+      1. ShopifyQL `sales` GROUP BY order_name -- the same event-dated ledger
+         net_sales/compute_day_metrics already uses, just also split by
+         order_name. This is what makes it match: a refund or order-edit
+         counts on the day it actually happened, exactly like the official
+         figure, regardless of which day/month the order was originally
+         created.
+      2. fetch_order_channel_region() above -- an exact-name lookup (not a
+         date scan) of just those specific orders' real per-order channel,
+         since ShopifyQL's own `sales_channel` dimension groups by the
+         connecting APP instead (on this store: Shopee/TikTok/Lazada all
+         lumped under one bundled connector app's name, "Easy Shopee, TikTok
+         & Lazada" -- doesn't match the Shopify admin's Orders list "Channel"
+         column at all).
+
+    Best-effort: returns ({}, {}) on failure rather than raising, so a
+    breakdown hiccup never takes down the day's actual sales figure (the
+    thing that matters most).
+    """
+    rows = fetch_shopifyql(
+        f"FROM sales SHOW net_sales GROUP BY order_name SINCE {date_str} UNTIL {date_str}"
+    )
+    if not rows:
+        return {}, {}
+
+    net_by_order = {}
+    for r in rows:
+        name = r.get("order_name")
+        if not name:
+            continue
+        net_by_order[name] = net_by_order.get(name, 0.0) + float(r.get("net_sales") or 0)
+
+    channel_region_by_order = fetch_order_channel_region(list(net_by_order.keys()))
+
+    channels, regions = {}, {}
+    for name, net in net_by_order.items():
+        ch, prov = channel_region_by_order.get(name, ("Other", "Unknown"))
+        channels[ch] = channels.get(ch, 0.0) + net
+        regions[prov] = regions.get(prov, 0.0) + net
     return channels, regions
 
 
 def compute_day_metrics(day_start_my, day_end_my):
     """One MYT calendar day's sales metrics via ShopifyQL. day_end_my is
-    only used by the channel/region breakdown below -- ShopifyQL's own
-    SINCE/UNTIL is date-only and always covers the full day in the store's
-    configured timezone (confirmed set to GMT+08:00 Kuala Lumpur)."""
+    unused (kept so callers don't need to change) -- ShopifyQL's SINCE/UNTIL
+    is date-only and always covers the full day in the store's configured
+    timezone (confirmed set to GMT+08:00 Kuala Lumpur)."""
     date_str = day_start_my.strftime("%Y-%m-%d")
     rows = fetch_shopifyql(
         f"FROM sales SHOW net_sales, gross_sales, discounts, returns, orders "
@@ -265,7 +268,7 @@ def compute_day_metrics(day_start_my, day_end_my):
     if rows is None:
         return None
 
-    channels, regions = fetch_channel_region_breakdown(day_start_my, day_end_my)
+    channels, regions = fetch_channel_region_breakdown(date_str)
 
     if not rows:
         return {"net": 0.0, "gross": 0.0, "discounts": 0.0, "refunds": 0.0, "order_count": 0,
