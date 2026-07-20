@@ -153,40 +153,88 @@ def fetch_shopifyql(ql_query):
     return result.get("tableData", {}).get("rows", [])
 
 
-def fetch_channel_region_breakdown(date_str):
-    """One MYT day's net sales broken down by sales channel and billing
-    region, via ShopifyQL (sales_channel/billing_region are documented
-    dimensions on the `sales` table -- see
-    https://shopify.dev/docs/api/shopifyql/shopifyql-reference). One query
-    returns one row per (channel, region) pair; summed into two separate
-    dicts client-side so each totals correctly on its own.
+def fetch_channel_region_breakdown(day_start_my, day_end_my):
+    """One MYT day's net sales broken down by sales channel and shipping
+    region, via plain Orders GraphQL -- NOT ShopifyQL.
+
+    ShopifyQL's `sales_channel` dimension turned out to group by the
+    connecting APP, not the per-order channel: on this store it lumped
+    Shopee/TikTok/Lazada together under one bundled connector app's name
+    ("Easy Shopee, TikTok & Lazada"), which doesn't match what the Shopify
+    admin's own Orders list shows in its "Channel" column (a plain "Shopee"
+    or "TikTok" per order). That per-order value lives at
+    Order.channelInformation.channelDefinition.channelName -- an Orders API
+    field, not exposed as a ShopifyQL dimension. Channel/shipping address
+    don't change on an order edit, so the edit-tracking ShopifyQL was
+    introduced for (see compute_day_metrics' docstring) isn't needed here --
+    plain Orders GraphQL is both correct and simpler for this one.
+
+    Orders come back sorted ascending by CREATED_AT, so once a page's order
+    reaches day_end, every later page is also past it -- the loop breaks
+    immediately instead of draining all the way to "now", which matters a
+    lot for the historical backfill (one query per day, hundreds of days).
 
     Best-effort: returns ({}, {}) on failure rather than raising, so a
     breakdown hiccup never takes down the day's actual sales figure (the
-    thing that matters most) -- caller just gets an empty breakdown and an
-    [ERROR]/[WARN] line already printed by fetch_shopifyql above.
+    thing that matters most).
     """
-    rows = fetch_shopifyql(
-        f"FROM sales SHOW net_sales GROUP BY sales_channel, billing_region "
-        f"SINCE {date_str} UNTIL {date_str}"
-    )
-    if not rows:
-        return {}, {}
+    q = f"created_at:>={day_start_my.isoformat()} status:any"
+    query = """
+        query($cursor: String, $q: String) {
+          orders(first: 50, after: $cursor, query: $q, sortKey: CREATED_AT) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              createdAt
+              totalPriceSet { shopMoney { amount } }
+              channelInformation { channelDefinition { channelName } }
+              shippingAddress { province }
+            }
+          }
+        }
+    """
     channels, regions = {}, {}
-    for r in rows:
-        ch = r.get("sales_channel") or "Other"
-        reg = r.get("billing_region") or "Unknown"
-        val = float(r.get("net_sales") or 0)
-        channels[ch] = channels.get(ch, 0.0) + val
-        regions[reg] = regions.get(reg, 0.0) + val
+    cursor = None
+    day_end_ms = day_end_my.timestamp() * 1000
+
+    while True:
+        resp = requests.post(GRAPHQL_URL, headers=headers,
+                              json={"query": query, "variables": {"cursor": cursor, "q": q}})
+        if resp.status_code == 429:
+            time.sleep(float(resp.headers.get("Retry-After", 2)))
+            continue
+        if resp.status_code != 200:
+            print(f"   [ERROR] Channel/region Orders GraphQL error {resp.status_code}: {resp.text[:200]}")
+            return channels, regions
+        data = resp.json()
+        if "errors" in data:
+            print(f"   [ERROR] Channel/region Orders GraphQL errors: {data['errors']}")
+            return channels, regions
+
+        page = data.get("data", {}).get("orders", {})
+        hit_end = False
+        for o in page.get("nodes", []):
+            created_ms = datetime.fromisoformat(o["createdAt"].replace("Z", "+00:00")).timestamp() * 1000
+            if created_ms >= day_end_ms:
+                hit_end = True
+                break
+            val = float((o.get("totalPriceSet") or {}).get("shopMoney", {}).get("amount") or 0)
+            ch = ((o.get("channelInformation") or {}).get("channelDefinition") or {}).get("channelName") or "Other"
+            prov = (o.get("shippingAddress") or {}).get("province") or "Unknown"
+            channels[ch] = channels.get(ch, 0.0) + val
+            regions[prov] = regions.get(prov, 0.0) + val
+
+        if hit_end or not page.get("pageInfo", {}).get("hasNextPage"):
+            break
+        cursor = page.get("pageInfo", {}).get("endCursor")
+
     return channels, regions
 
 
 def compute_day_metrics(day_start_my, day_end_my):
     """One MYT calendar day's sales metrics via ShopifyQL. day_end_my is
-    unused (kept so callers don't need to change) -- ShopifyQL's SINCE/UNTIL
-    is date-only and always covers the full day in the store's configured
-    timezone (confirmed set to GMT+08:00 Kuala Lumpur)."""
+    only used by the channel/region breakdown below -- ShopifyQL's own
+    SINCE/UNTIL is date-only and always covers the full day in the store's
+    configured timezone (confirmed set to GMT+08:00 Kuala Lumpur)."""
     date_str = day_start_my.strftime("%Y-%m-%d")
     rows = fetch_shopifyql(
         f"FROM sales SHOW net_sales, gross_sales, discounts, returns, orders "
@@ -195,7 +243,7 @@ def compute_day_metrics(day_start_my, day_end_my):
     if rows is None:
         return None
 
-    channels, regions = fetch_channel_region_breakdown(date_str)
+    channels, regions = fetch_channel_region_breakdown(day_start_my, day_end_my)
 
     if not rows:
         return {"net": 0.0, "gross": 0.0, "discounts": 0.0, "refunds": 0.0, "order_count": 0,
