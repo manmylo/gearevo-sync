@@ -22,7 +22,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests firebase-admin pandas openpyxl
+        run: pip install -r requirements.txt
 
       - name: Run sync script
         env:
