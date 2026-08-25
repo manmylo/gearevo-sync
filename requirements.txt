@@ -1,3 +1,6 @@
 firebase-admin==7.5.0
 google-cloud-firestore==2.28.1
 google-api-core==2.34.0
+requests
+pandas
+openpyxl
